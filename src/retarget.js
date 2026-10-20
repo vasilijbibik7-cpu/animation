@@ -31,6 +31,9 @@ const HAND_CHAINS = [
 
 // Пальцы короткие, а точки кисти дрожат: без сглаживания палец трясётся на месте.
 const FINGER_SMOOTH = 0.55;
+// Кисть на первом кадре может «прыгнуть» из rest в ладонь — сглаживаем, чтобы
+// это был поворот за 3–4 кадра, а не щелчок.
+const HAND_SMOOTH = 0.5;
 
 // Индексы точек MediaPipe Pose (33 шт.)
 export const MP = {
@@ -374,6 +377,7 @@ export class Retargeter {
         tmpQ.multiply(restLocal);
         // Пальцы сглаживаем: соседние кадры кисти дрожат, палец короткий.
         if (this.fingerKeys.has(key)) bone.quaternion.slerp(tmpQ, FINGER_SMOOTH);
+        else if (key === 'lHand' || key === 'rHand') bone.quaternion.slerp(tmpQ, HAND_SMOOTH);
         else bone.quaternion.copy(tmpQ);
         worldQ.set(bone, parentQ.clone().multiply(bone.quaternion));
       } else if (key && this.handKeys.has(key)) {
