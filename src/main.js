@@ -738,6 +738,22 @@ function updateHud() {
     }
   }
 
+  // Кадрирование: где тело в кадре и сколько запаса до краёв. Главная причина
+  // поломанных ног — не модель, а край кадра, поэтому это видно всегда.
+  const fInfo = $('frameInfo');
+  if (fInfo) {
+    const f = state.mode === 'live' && !state.synthetic ? framingReport() : null;
+    const v = framingVerdict(f);
+    fInfo.textContent = v.info;
+    fInfo.className = v.level === 'bad' ? 'bad' : v.level === 'tight' ? 'hot' : v.level === 'ok' ? 'ok' : '';
+    const fHint = $('frameHint');
+    if (fHint) {
+      fHint.textContent = v.hint;
+      fHint.className = 'hint' + (v.level && v.level !== 'ok' ? ' hot' : '');
+    }
+    drawFrameBox(f, v.level);
+  }
+
   // Телеметрия: счётчик отправленных срезов
   const teleEl = $('teleState');
   if (teleEl) {
@@ -786,6 +802,169 @@ function boxOf(pts, idx) {
   return n ? [r3(x0), r3(y0), r3(x1), r3(y1)] : null;
 }
 
+// ---------- кадрирование ----------
+// Самая частая причина поломанных ног — не модель и не IK, а кадр: стопы у
+// нижней кромки, голова у верхней, и на шаге точка уходит за край, где модель
+// начинает её дорисовывать. Индикатор считает запас до краёв по точкам КАДРА
+// (где модель видит человека, а не где мы его нарисовали) и говорит, что делать.
+const SAFE_EDGE = 0.05; // минимальный запас до края, доля кадра
+const FRAME_MEMORY = 5000; // мс: помним худший запас за это время
+let frameHistory = [];
+
+function framingReport() {
+  const pts = lastImagePts;
+  if (!pts || pts.length < 33) return null;
+  let minX = 1, maxX = 0, minY = 1, maxY = 0, n = 0, out = 0;
+  for (const p of pts) {
+    if (!p || (p.visibility ?? 1) < 0.5) continue;
+    n++;
+    if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) out++;
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const nose = pts[0];
+  if (n < 10 || !nose || (nose.visibility ?? 1) < 0.5) return null;
+
+  // низ тела — самая низкая из видимых точек стоп
+  let soleY = nose.y;
+  for (const i of [29, 30, 31, 32, 27, 28]) {
+    const p = pts[i];
+    if (p && (p.visibility ?? 1) >= 0.5 && p.y > soleY) soleY = p.y;
+  }
+  const H = Math.max(0.01, soleY - nose.y);
+  // макушка выше носа и подошва ниже носка — точки в 33 landmark'ах не отдают
+  const top = nose.y - H * 0.07;
+  const sole = soleY + H * 0.02;
+  const f = {
+    n,
+    out,
+    body: r3(sole - top), // сколько кадра занимает человек целиком
+    top: r3(top),
+    bottom: r3(1 - sole),
+    left: r3(minX),
+    right: r3(1 - maxX),
+    box: [r3(minX), r3(minY), r3(maxX), r3(maxY)],
+  };
+
+  // Худшее за последние 5 с: в шаге тело поднимается выше и опускается ниже, чем
+  // в стойке, и «запас сейчас» обманывает — смотреть надо на худший момент.
+  const now = performance.now();
+  const last = frameHistory[frameHistory.length - 1];
+  if (!last || now - last.t > 150) {
+    frameHistory.push({ t: now, top: f.top, bottom: f.bottom, body: f.body });
+    while (frameHistory.length && now - frameHistory[0].t > FRAME_MEMORY) frameHistory.shift();
+  }
+  f.worstTop = Math.min(...frameHistory.map((h) => h.top));
+  f.worstBottom = Math.min(...frameHistory.map((h) => h.bottom));
+  f.worstBody = Math.max(...frameHistory.map((h) => h.body));
+  return f;
+}
+
+// Что сказать человеку. Уровень: ok / tight / bad — тот же цвет в HUD и на схеме.
+function framingVerdict(f) {
+  const fit = 1 - 2 * SAFE_EDGE; // 0.9 кадра — предел с запасом 5 % по краям
+  const pct = (v) => `${Math.round(Math.max(0, v) * 100)} %`;
+  if (!f) {
+    return {
+      level: '',
+      info: 'нет данных',
+      hint: 'Кадр не считается: включите камеру или тестовый скелет',
+    };
+  }
+  // срезано ли что-то сейчас или было срезано за последние 5 с
+  const cutNow = f.out > 0 || f.top < 0 || f.bottom < 0;
+  const cutTop = Math.max(0, -f.top, -(f.worstTop ?? f.top));
+  const cutBottom = Math.max(0, -f.bottom, -(f.worstBottom ?? f.bottom));
+  const cut = cutNow || cutTop > 0 || cutBottom > 0;
+  const body = Math.max(f.body, f.worstBody ?? 0);
+  // сколько кадра заняло бы всё тело, включая срезанное
+  const extent = body + cutTop + cutBottom;
+  const away = Math.max(0, Math.round((extent / fit - 1) * 100));
+  const stepWord = away <= 5 ? 'чуть дальше' : away <= 16 ? 'на полшага дальше' : 'на шаг дальше';
+  const tight = Math.min(f.top, f.bottom);
+  const worst = Math.min(f.worstTop ?? f.top, f.worstBottom ?? f.bottom);
+  const wasTight = worst < tight - 0.03;
+
+  if (cut) {
+    return {
+      level: cutNow ? 'bad' : 'tight',
+      info: cutNow ? `${pct(body)} кадра · за краем` : `${pct(f.body)} кадра · в шаге за краем`,
+      hint: cutNow
+        ? `Тело не влезает в кадр: отойдите ${stepWord} (примерно на ${Math.max(5, away)} % дальше) — срезанное модель дорисовывает.`
+        : `В стойке тело влезает, но в движении выходит за край: отойдите ${stepWord} (примерно на ${Math.max(5, away)} % дальше).`,
+    };
+  }
+  if (body > fit) {
+    return {
+      level: 'tight',
+      info: `${pct(body)} кадра · запас ${pct(tight)}${wasTight ? ` · в шаге ${pct(worst)}` : ''}`,
+      hint: `Тело занимает ${pct(body)} кадра, для запаса нужно до ${pct(fit)}: отойдите ${stepWord}.`,
+    };
+  }
+  if (f.bottom < SAFE_EDGE && f.top >= SAFE_EDGE) {
+    return {
+      level: 'tight',
+      info: `снизу ${pct(f.bottom)} · тело ${pct(f.body)}`,
+      hint: 'Стопы у нижнего края: наклоните камеру ниже (или опустите её) — на шаге ступня выйдет за край.',
+    };
+  }
+  if (f.top < SAFE_EDGE && f.bottom >= SAFE_EDGE) {
+    return {
+      level: 'tight',
+      info: `сверху ${pct(f.top)} · тело ${pct(f.body)}`,
+      hint: 'Голова у верхнего края: наклоните камеру выше (или поднимите её).',
+    };
+  }
+  if (Math.min(f.left, f.right) < SAFE_EDGE * 0.6) {
+    return {
+      level: 'tight',
+      info: `по бокам ${pct(Math.min(f.left, f.right))}`,
+      hint: 'Руки почти у края кадра: чуть дальше или разверните камеру.',
+    };
+  }
+  return {
+    level: 'ok',
+    info: `${pct(f.body)} кадра · сверху ${pct(f.top)} · снизу ${pct(f.bottom)}${wasTight ? ` · в шаге ${pct(worst)}` : ''}`,
+    hint: wasTight
+      ? 'В стойке запас есть, но в движении край близко: чуть дальше — и шаг перестанет выходить за кадр.'
+      : 'Всё тело в кадре с запасом — ноги не ломаются.',
+  };
+}
+
+// Схема кадра: где человек и где безопасная зона
+function drawFrameBox(f, level) {
+  const cv = $('frameBox');
+  if (!cv) return;
+  const g = cv.getContext('2d');
+  const w = cv.width;
+  const h = cv.height;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = '#0b0f16';
+  g.fillRect(0, 0, w, h);
+
+  // безопасная зона
+  const m = SAFE_EDGE;
+  g.strokeStyle = '#2b3a55';
+  g.lineWidth = 1;
+  g.setLineDash([4, 4]);
+  g.strokeRect(0.5, m * h + 0.5, w - 1, (1 - 2 * m) * h - 1);
+  g.setLineDash([]);
+
+  if (!f) return;
+  const col = level === 'bad' ? '#ff7b72' : level === 'tight' ? '#ffd166' : '#7ee787';
+  const x0 = Math.max(-0.15, f.box[0]) * w;
+  const x1 = Math.min(1.15, f.box[2]) * w;
+  const y0 = Math.max(-0.15, f.top) * h;
+  const y1 = Math.min(1.15, 1 - f.bottom) * h;
+  g.fillStyle = col + '22';
+  g.fillRect(x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0));
+  g.strokeStyle = col;
+  g.lineWidth = 2;
+  g.strokeRect(x0 + 1, y0 + 1, Math.max(1, x1 - x0 - 2), Math.max(1, y1 - y0 - 2));
+}
+
 function telemetryPayload(now) {
   const g = retargeter && retargeter.legGuard;
   const wp = (name) => {
@@ -825,6 +1004,13 @@ function telemetryPayload(now) {
         feet,
       }
       : null,
+    // Кадрирование: запас до краёв кадра и вердикт (ok/tight/bad) — то, что
+    // решает, будут ли ноги целыми.
+    frame: (() => {
+      const f = framingReport();
+      const v = framingVerdict(f);
+      return f ? { ...f, level: v.level } : null;
+    })(),
   };
 }
 
@@ -1542,6 +1728,8 @@ function wireUi() {
     undoPolish,
     doAlignLoop,
     qualityReport,
+    framingReport,
+    framingVerdict,
     polishLib: { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor },
     footRestY,
     bvhText: () => (recorder?.hasClip ? buildBVH(bvhOptions()) : ''),

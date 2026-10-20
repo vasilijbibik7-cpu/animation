@@ -24,6 +24,7 @@
   .row .k { color: #8194b3; }
   .ok { color: #7ee787; }
   .bad { color: #ff7b72; }
+  .hot { color: #ffd166; }
   hr { border: 0; border-top: 1px solid #263149; margin: 11px 0; }
   button {
     width: 100%; padding: 7px 10px; margin: 4px 0; cursor: pointer;
@@ -57,6 +58,12 @@
   #count.on { display: flex; }
   .hint { color: #8194b3; font-size: 12px; }
   .hint.hot { color: #ffd166; }
+  .frame { display: flex; gap: 8px; align-items: center; margin: 6px 0 2px; }
+  .frame canvas {
+    flex: 0 0 auto; width: 96px; height: 54px;
+    border: 1px solid #263149; border-radius: 6px; background: #0b0f16;
+  }
+  .frame .txt { flex: 1 1 auto; min-width: 0; }
   #gestHint { margin: 6px 0 2px; }
   #trim {
     width: 100%; display: block; border: 1px solid #263149; border-radius: 6px;
@@ -81,6 +88,13 @@
   <div class="row"><span class="k">Костей Mixamo</span><span id="bones">0</span></div>
   <div class="row"><span class="k">Клип в файле</span><span id="clipName">—</span></div>
   <div class="row"><span class="k">Ноги</span><span id="legsInfo">—</span></div>
+  <div class="frame">
+    <canvas id="frameBox" width="192" height="108"></canvas>
+    <div class="txt">
+      <div id="frameInfo">—</div>
+      <div id="frameHint" class="hint">—</div>
+    </div>
+  </div>
   <div class="row"><span class="k">Телеметрия</span><span id="teleState">выкл</span></div>
 
   <hr>
