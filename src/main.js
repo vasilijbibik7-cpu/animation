@@ -14,6 +14,7 @@ import { Retargeter, StandingTracker, landmarkToWorld } from './retarget.js';
 import { startCamera, stopCamera, listCameras, describeCameraError, permissionState } from './capture.js';
 import { Recorder } from './record.js';
 import { buildBVH, buildLandmarkJson, downloadText } from './bvh.js';
+import { parseLandmarkJson, retargetTake } from './import.js';
 import { ArmsUpTrigger } from './gesture.js';
 import { TrimStrip } from './trim.js';
 import { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor } from './polish.js';
@@ -1840,6 +1841,55 @@ function exportJson() {
   log(`Точки сохранены: ${recorder.frameCount} кадров`);
 }
 
+// Импорт точек: JSON → ретаргет с текущими настройками → новый дубль.
+// Камера не нужна: BVH можно пересобрать с другим ростом, зеркалом или
+// глубиной из той же съёмки.
+async function loadJsonFile(file) {
+  if (!recorder || !retargeter) return null;
+  if (recorder.recording || recorder.countdown > 0) {
+    log('Импорт: сначала остановите запись');
+    return null;
+  }
+  let data;
+  try {
+    data = parseLandmarkJson(await file.text());
+  } catch (err) {
+    log('Импорт: ' + (err?.message || err));
+    return null;
+  }
+  const label = (file.name || 'json').replace(/\.json$/i, '').slice(0, 24);
+  log(`Импорт «${file.name}»: ${data.landmarks.length} кадров…`);
+  let r;
+  try {
+    r = retargetTake(data, {
+      retargeter,
+      recorder,
+      heightMeters: state.heightMeters,
+      mirror: state.mirror,
+      zGain: state.zGain,
+      followFeet: state.followHips,
+      rootMotion: state.rootMotion,
+      legGuard: state.legGuard,
+      label,
+    });
+  } catch (err) {
+    console.warn(err);
+    // Неудачный импорт не должен оставлять пустой экран: возвращаем прежний дубль.
+    if (recorder.activeTake < 0 && recorder.takes.length) {
+      recorder.setTake(recorder.takes.length - 1);
+    }
+    log('Импорт не удался: ' + (err?.message || err));
+    updateRecUi();
+    return null;
+  }
+  updateRecUi();
+  log(
+    `Импорт готов: «${label}» · ${r.frames} кадр. · ${r.duration.toFixed(1)} с · ` +
+    `рост ${r.height.toFixed(2)} м`,
+  );
+  return r;
+}
+
 // Проверка BVH: читаем свой же файл BVHLoader'ом, ставим те же кадры и
 // сравниваем мировые позиции костей с моделью. Ловит ошибки порядка каналов
 // и знаков углов — то, что глазами не видно, а в Blender вылезет.
@@ -2055,8 +2105,17 @@ function doAlignLoop() {
 }
 
 // ---------- UI ----------
+// Сменились кадры (новая запись, другой дубль, импорт): петля и сводка
+// шлифовки относились к прежним кадрам и больше не действуют.
+let recFramesRef = null;
+
 function updateRecUi() {
   if (!recorder) return;
+  if (recorder.frames !== recFramesRef) {
+    recFramesRef = recorder.frames;
+    state.loop = null;
+    state.polish = null;
+  }
   const b = $('btnRec');
   b.textContent = recorder.recording ? '■ Стоп' : recorder.countdown > 0 ? 'Отмена' : '● Записать';
   $('btnPlayRec').textContent = recorder.playing ? '⏸ Остановить запись' : '▶ Проиграть запись';
@@ -2064,7 +2123,10 @@ function updateRecUi() {
   $('btnBvh').disabled = !recorder.hasClip;
   $('btnJson').disabled = !recorder.hasClip;
   $('btnBvhCheck').disabled = !recorder.hasClip;
+  const load = $('btnJsonLoad');
+  if (load) load.disabled = recorder.recording || recorder.countdown > 0;
   renderSegments();
+  renderTakes();
   updateTrimUi();
   updatePolishUi();
 }
@@ -2141,6 +2203,55 @@ function renderSegments() {
     btn.addEventListener('click', () => recorder.setSegment(i));
     box.appendChild(btn);
   });
+}
+
+// Дубли записи: каждый прогон остаётся отдельным клипом. Переключение не
+// трогает камеру — меняются только кадры, которые смотрят подрезка, шлифовка
+// и экспорт.
+function renderTakes() {
+  const box = $('takes');
+  const info = $('takesInfo');
+  if (!box || !recorder) return;
+  const list = recorder.takes;
+  box.textContent = '';
+  box.style.display = list.length ? 'flex' : 'none';
+  list.forEach((t, i) => {
+    const frames = recorder.takeFrames(i);
+    const sec = frames.length / recorder.fps;
+    const btn = document.createElement('button');
+    btn.className = 'seg' + (i === recorder.activeTake ? ' on' : '');
+    btn.textContent = `${t.label} · ${sec.toFixed(1)}с`;
+    btn.title = t.source === 'json'
+      ? 'Импорт точек из JSON — кадры пересобраны ретаргетом'
+      : 'Запись с камеры';
+    btn.addEventListener('click', () => chooseTake(i));
+    box.appendChild(btn);
+  });
+  if (info) {
+    info.textContent = list.length
+      ? `${list.length} · активный ${recorder.activeTake >= 0 ? recorder.activeTake + 1 : '—'}`
+      : 'нет';
+  }
+  const del = $('btnTakeDel');
+  if (del) del.disabled = !list.length || recorder.activeTake < 0 || recorder.recording;
+}
+
+function chooseTake(i) {
+  if (!recorder) return;
+  if (recorder.recording) {
+    log('Идёт запись — дубли подождут');
+    return;
+  }
+  if (!recorder.setTake(i)) return;
+  log(`Дубль ${i + 1}: ${recorder.frameCount} кадр. · ${recorder.duration.toFixed(1)} с`);
+}
+
+function dropTake() {
+  if (!recorder || recorder.recording || recorder.activeTake < 0) return;
+  recorder.removeTake();
+  log(recorder.takes.length
+    ? `Дубль удалён, осталось ${recorder.takes.length}`
+    : 'Все дубли удалены');
 }
 
 function backToLive() {
@@ -2271,6 +2382,13 @@ function wireUi() {
 
   $('btnBvh').addEventListener('click', exportBvh);
   $('btnJson').addEventListener('click', exportJson);
+  $('btnJsonLoad').addEventListener('click', () => $('jsonFile').click());
+  $('jsonFile').addEventListener('change', async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = ''; // один и тот же файл можно выбрать ещё раз
+    if (f) await loadJsonFile(f);
+  });
+  $('btnTakeDel').addEventListener('click', dropTake);
   $('chkLoopFade').addEventListener('change', (e) => {
     if (!recorder) return;
     recorder.loopFade = e.target.checked; // сшивка считается на лету
@@ -2388,6 +2506,15 @@ async function resolveModelPath() {
     footRestY,
     bvhText: () => (recorder?.hasClip ? buildBVH(bvhOptions()) : ''),
     jsonText: () => (recorder?.hasClip ? buildLandmarkJson(recorder, jsonMeta()) : ''),
+    importJson: (text, name = 'import.json') =>
+      loadJsonFile(new File([text], name, { type: 'application/json' })),
+    chooseTake,
+    dropTake,
+    takes: () => (recorder
+      ? recorder.takes.map((t, i) => ({
+        id: t.id, label: t.label, source: t.source, frames: recorder.takeFrames(i).length,
+      }))
+      : []),
     // Прогнать статичную картинку через тот же путь, что и камеру
     testFrame: async (url) => {
       const img = new Image();

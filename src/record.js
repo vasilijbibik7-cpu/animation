@@ -53,6 +53,13 @@ export class Recorder {
     this.fadeSeconds = fadeSeconds;
     this.lost = 0; // сколько секунд записи пропущено из-за потери трекинга
 
+    // Дубли: каждая запись или импорт остаются в списке, а не затирают
+    // предыдущую. Активный дубль — тот, что сейчас лежит в frames/segments.
+    this.takes = [];
+    this.activeTake = -1;
+    this._takeId = 0;
+    this._pendingTake = null;
+
     this._qa = new THREE.Quaternion();
     this._qb = new THREE.Quaternion();
     this._q = new THREE.Quaternion();
@@ -148,6 +155,85 @@ export class Recorder {
     this.onChange();
   }
 
+  // ---- дубли ----
+  // Один дубль — это один прогон записи (или импорт JSON). Поля дубля — те же,
+  // что у recorder, и хранятся ссылками: кадры и куски не копируются. Поэтому
+  // состояние активного дубля снимаем в него только в момент ухода с него
+  // (новая запись, переключение, удаление).
+  _syncTake() {
+    const t = this.takes[this.activeTake];
+    if (!t) return;
+    t.frames = this.frames;
+    t.segments = this.segments;
+    t.activeSegment = this.activeSegment;
+    t.inFrame = this.inFrame;
+    t.outFrame = this.outFrame;
+    t.lost = this.lost;
+  }
+
+  // Записать текущие кадры как новый дубль. Обычно вызывается из stop().
+  saveTake({ label = '', source = 'live' } = {}) {
+    if (!this.frames.length) return null;
+    const id = ++this._takeId;
+    const take = {
+      id,
+      label: label || `Дубль ${id}`,
+      at: Date.now(),
+      source,
+    };
+    this.takes.push(take);
+    this.activeTake = this.takes.length - 1;
+    this._syncTake();
+    this.onChange();
+    return take;
+  }
+
+  // Кадры дубля: у активного их надо брать из recorder — подрезка, шлифовка и
+  // смена фрагмента меняют именно его.
+  takeFrames(i) {
+    return i === this.activeTake ? this.frames : (this.takes[i]?.frames || []);
+  }
+
+  setTake(i) {
+    const t = this.takes[i];
+    if (!t || this.recording) return false;
+    this._syncTake();
+    const frames = t.frames || [];
+    this.activeTake = i;
+    this.frames = frames;
+    this.segments = t.segments?.length ? t.segments : (frames.length ? [{ frames }] : []);
+    this.activeSegment = Math.min(t.activeSegment ?? 0, Math.max(0, this.segments.length - 1));
+    this.inFrame = t.inFrame ?? 0;
+    this.outFrame = t.outFrame ?? frames.length;
+    this.lost = t.lost || 0;
+    this.countdown = 0;
+    this.playing = false;
+    this.playTime = 0;
+    this.samples = [];
+    this._clip = null;
+    this.onChange();
+    return true;
+  }
+
+  removeTake(i = this.activeTake) {
+    if (this.recording || !this.takes[i]) return false;
+    this._syncTake();
+    this.takes.splice(i, 1);
+    if (!this.takes.length) {
+      this.clear();
+      return true;
+    }
+    this.activeTake = -1; // следующий дубль загружаем как есть, без sync
+    this.setTake(Math.min(i, this.takes.length - 1));
+    return true;
+  }
+
+  // Прервать запись, не создавая дубль (ошибка импорта JSON).
+  abort() {
+    this.recording = false;
+    this.clear();
+  }
+
   // ---- управление ----
   beginCountdown(seconds = 3.2) {
     if (this.recording) return;
@@ -164,8 +250,13 @@ export class Recorder {
     }
   }
 
-  start(t) {
+  start(t, take = null) {
     this.countdown = 0;
+    // Прежний дубль оставляем в списке: снимаем с него итоговое состояние
+    // (подрезку, шлифовку), пока кадры не очищены.
+    this._syncTake();
+    this.activeTake = -1; // новая запись станет дублем только после stop()
+    this._pendingTake = take || { label: '', source: 'live' };
     this.samples = [];
     this.frames = [];
     this.segments = [];
@@ -206,7 +297,12 @@ export class Recorder {
     this.inFrame = 0;
     this.outFrame = this.frames.length;
     this._clip = null;
-    this.onChange();
+    // Новая запись становится дублем. Если кадров не набралось (человек так и
+    // не появился в кадре), прежние дубли остаются нетронутыми.
+    const pending = this._pendingTake;
+    this._pendingTake = null;
+    if (this.frames.length) this.saveTake(pending || {});
+    else this.onChange();
   }
 
   // Режем сэмплы там, где зияет дырка: человек вышел из кадра / отошёл.
@@ -295,6 +391,8 @@ export class Recorder {
     this.outFrame = 0;
     this._clip = null;
     this.playing = false;
+    this.activeTake = -1;
+    this._pendingTake = null;
     this.onChange();
   }
 

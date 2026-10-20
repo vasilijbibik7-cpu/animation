@@ -136,6 +136,9 @@
   <button id="btnRec">● Записать</button>
   <button id="btnPlayRec" disabled>▶ Проиграть запись</button>
   <div class="hint" id="gestHint">Поднимите обе руки — запись начнётся сама</div>
+  <div class="row"><span class="k">Дубли</span><span id="takesInfo">—</span></div>
+  <div id="takes" class="segs"></div>
+  <button id="btnTakeDel" disabled>Удалить дубль</button>
 
   <div class="slider">
     <div class="row"><span class="k">Диапазон (тяните рамку)</span><span id="trimInfo">—</span></div>
@@ -157,6 +160,9 @@
 
   <button id="btnBvh" disabled>Сохранить BVH (Blender)</button>
   <button id="btnJson" disabled>Сохранить JSON точек</button>
+  <button id="btnJsonLoad">Загрузить JSON точек…</button>
+  <input type="file" id="jsonFile" accept=".json,application/json" hidden>
+  <div class="hint">JSON точек можно вернуть: рост, зеркало и глубина применятся заново, снимать не нужно.</div>
   <button id="btnBvhCheck" disabled>Проверить BVH</button>
   <label class="chk"><input type="checkbox" id="chkLoopFade" checked> Сшивать цикл (0.3 с)</label>
   <label class="chk"><input type="checkbox" id="chkGesture" checked> Запись жестом (руки вверх)</label>
