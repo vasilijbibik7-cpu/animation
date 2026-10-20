@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mocap → three.js</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1017; }
+  body { font: 13px/1.45 "Segoe UI", system-ui, sans-serif; color: #dbe4f3; }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  #hud {
+    position: fixed; top: 12px; left: 12px; width: 268px;
+    background: rgba(14, 18, 27, .88); border: 1px solid #263149;
+    border-radius: 10px; padding: 12px; backdrop-filter: blur(6px);
+    max-height: calc(100vh - 24px); overflow: auto;
+  }
+  #hud h1 { font-size: 14px; margin: 0 0 10px; letter-spacing: .3px; }
+  #hud h1 span { color: #63e6ff; }
+  .row { display: flex; justify-content: space-between; gap: 8px; margin: 5px 0; }
+  .row .k { color: #8194b3; }
+  .ok { color: #7ee787; }
+  .bad { color: #ff7b72; }
+  hr { border: 0; border-top: 1px solid #263149; margin: 11px 0; }
+  button {
+    width: 100%; padding: 7px 10px; margin: 4px 0; cursor: pointer;
+    background: #1b2436; color: #dbe4f3; border: 1px solid #33415c; border-radius: 7px;
+    font: inherit;
+  }
+  button:hover:not(:disabled) { background: #23304a; }
+  button:disabled { opacity: .45; cursor: default; }
+  label.chk { display: flex; align-items: center; gap: 8px; margin: 7px 0; cursor: pointer; }
+  select {
+    width: 100%; padding: 6px 8px; margin: 2px 0 4px; cursor: pointer;
+    background: #1b2436; color: #dbe4f3; border: 1px solid #33415c; border-radius: 7px;
+    font: inherit;
+  }
+  select:disabled { opacity: .5; cursor: default; }
+  input[type=range] { width: 100%; }
+  .slider { margin: 8px 0 2px; }
+  .slider span { color: #8194b3; }
+  #cam {
+    position: fixed; right: 12px; bottom: 12px; width: 320px; height: 240px;
+    border: 1px solid #33415c; border-radius: 10px; overflow: hidden; background: #000;
+  }
+  #cam.rec { border-color: #ff5c5c; box-shadow: 0 0 0 2px rgba(255, 92, 92, .35); }
+  #cam canvas { width: 100%; height: 100%; }
+  #video { display: none; }
+  #count {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    font-size: 22vh; font-weight: 700; color: #fff; text-shadow: 0 0 30px rgba(0,0,0,.8);
+    pointer-events: none; z-index: 5;
+  }
+  #count.on { display: flex; }
+  .hint { color: #8194b3; font-size: 12px; }
+  .hint.hot { color: #ffd166; }
+  #gestHint { margin: 6px 0 2px; }
+  #trim {
+    width: 100%; display: block; border: 1px solid #263149; border-radius: 6px;
+    cursor: ew-resize; touch-action: none;
+  }
+  .segs { display: none; gap: 4px; align-items: center; margin: 6px 0 0; flex-wrap: wrap; }
+  .segs .k { color: #8194b3; font-size: 12px; }
+  .segs .seg { width: auto; padding: 3px 7px; margin: 0; font-size: 11px; }
+  .segs .seg.on { border-color: #63e6ff; color: #63e6ff; }
+  .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ff5c5c; margin-right: 5px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="hud">
+  <h1>Mocap → <span>three.js</span></h1>
+
+  <div class="row"><span class="k">Состояние</span><span id="track" class="bad">ожидание</span></div>
+  <div class="row"><span class="k">Камера</span><span id="camState">выключена</span></div>
+  <div class="row"><span class="k">FPS</span><span id="fps">0</span></div>
+  <div class="row"><span class="k">Костей Mixamo</span><span id="bones">0</span></div>
+  <div class="row"><span class="k">Клип в файле</span><span id="clipName">—</span></div>
+  <div class="row"><span class="k">Ноги</span><span id="legsInfo">—</span></div>
+  <div class="row"><span class="k">Телеметрия</span><span id="teleState">выкл</span></div>
+
+  <hr>
+  <select id="camPick" title="Камера"></select>
+  <button id="btnCam">Включить камеру</button>
+  <button id="btnTest">Тест без камеры</button>
+  <button id="btnPlay">Проиграть клип FBX</button>
+  <button id="btnCal">Перекалибровать</button>
+  <button id="btnTele">Телеметрия: выкл</button>
+
+  <hr>
+  <div class="row"><span class="k">Запись</span><span id="recState">—</span></div>
+  <button id="btnRec">● Записать</button>
+  <button id="btnPlayRec" disabled>▶ Проиграть запись</button>
+  <div class="hint" id="gestHint">Поднимите обе руки — запись начнётся сама</div>
+
+  <div class="slider">
+    <div class="row"><span class="k">Диапазон (тяните рамку)</span><span id="trimInfo">—</span></div>
+    <canvas id="trim" width="244" height="46"></canvas>
+    <div id="segs" class="segs"></div>
+    <button id="btnLoopAlign" disabled>Выровнять петлю</button>
+    <button id="btnTrimReset" disabled>Сбросить подрезку</button>
+  </div>
+
+  <hr>
+  <div class="row"><span class="k">Шлифовка</span><span id="quality">записи нет</span></div>
+  <label class="chk"><input type="checkbox" id="chkPolishPin" checked> Приклеить стопы (убрать скольжение)</label>
+  <label class="chk"><input type="checkbox" id="chkPolishSmooth"> Сгладить дрожь</label>
+  <label class="chk"><input type="checkbox" id="chkPolishDrift"> Шаг на месте (убрать дрейф)</label>
+  <button id="btnPolish" disabled>Шлифовать запись</button>
+  <button id="btnPolishUndo" disabled>Отменить шлифовку</button>
+  <div class="hint">«Приклеить стопы» и «шаг на месте» спорят: для прохода по комнате дрейф лучше не убирать.</div>
+
+  <button id="btnBvh" disabled>Сохранить BVH (Blender)</button>
+  <button id="btnJson" disabled>Сохранить JSON точек</button>
+  <button id="btnBvhCheck" disabled>Проверить BVH</button>
+  <label class="chk"><input type="checkbox" id="chkLoopFade" checked> Сшивать цикл (0.3 с)</label>
+  <label class="chk"><input type="checkbox" id="chkGesture" checked> Запись жестом (руки вверх)</label>
+  <div class="hint">BVH: Blender → File → Import → Motion Capture (.bvh)</div>
+
+  <hr>
+  <label class="chk"><input type="checkbox" id="chkMirror"> Зеркало (как в зеркале)</label>
+  <label class="chk"><input type="checkbox" id="chkFollow" checked> Таз по высоте стоп (приседания)</label>
+  <label class="chk"><input type="checkbox" id="chkFootLock" checked> Стопы на полу (IK)</label>
+  <label class="chk"><input type="checkbox" id="chkLegGuard" checked> Ноги: не верить точкам, пока их плохо видно</label>
+  <div class="hint" id="legsHint">Ноги в порядке: колени и стопы идут с камеры</div>
+  <label class="chk"><input type="checkbox" id="chkRootMotion" checked> Корневое движение</label>
+  <label class="chk"><input type="checkbox" id="chkFollowCam" checked> Камера следит за персонажем</label>
+  <label class="chk"><input type="checkbox" id="chkDebug" checked> Показывать камеру и точки</label>
+
+  <div class="slider">
+    <div class="row"><span class="k">Рост, м</span><span id="heightVal">1.75</span></div>
+    <input type="range" id="height" min="1.4" max="2.1" step="0.01" value="1.75">
+  </div>
+
+  <div class="slider">
+    <div class="row"><span class="k">Глубина (Z)</span><span id="zGainVal">1.0</span></div>
+    <input type="range" id="zGain" min="0" max="2.5" step="0.1" value="1">
+  </div>
+
+  <hr>
+  <div class="hint" id="status">Загружаю скелет…</div>
+</div>
+
+<div id="cam">
+  <canvas id="overlay" width="320" height="240"></canvas>
+  <video id="video" playsinline muted></video>
+</div>
+
+<div id="count"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/jsm/"
+  }
+}
+</script>
+<script type="module" src="./src/main.js"></script>
+<script>
+  const z = document.getElementById('zGain');
+  z.addEventListener('input', () => {
+    document.getElementById('zGainVal').textContent = Number(z.value).toFixed(1);
+  });
+</script>
+</body>
+</html>
