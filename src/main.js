@@ -27,6 +27,10 @@ const MODEL = (() => {
   return ['lite', 'full', 'heavy'].includes(m) ? m : 'full';
 })();
 
+// Две камеры: ?legs=cam1 — вторая только смотрит, ?legs=cam2 — сразу брать
+// ноги со второй. По умолчанию слияние включается вместе со второй камерой.
+const LEGS_MODE = new URLSearchParams(location.search).get('legs') || 'auto';
+
 const CONFIG = {
   // Персонаж Mixamo с мешем — то, что видно в превью. Если файла нет,
   // приложение берёт старый риг без меша и работает как раньше.
@@ -65,6 +69,10 @@ const state = {
   gesture: true,
   sound: true,
   hands: CONFIG.hands,
+  // Две камеры: первая смотрит на верх тела, вторая — на ноги. Галочка
+  // включает слияние; пока вторая камера выключена, она ни на что не влияет.
+  legsB: LEGS_MODE === 'cam2',
+  legsSrc: 'cam1',
   handsOk: false,
   handsMs: 0,
   handsCount: 0,
@@ -481,6 +489,102 @@ function legLengths(pts) {
   return out;
 }
 
+// ---------- две камеры: верх с первой, ноги со второй ----------
+// Зачем: в комнате не отойти на 3 метра, а вблизи модель видит человека
+// крупнее и точнее. Первая камера берёт голову, руки и таз, вторая — таз и
+// ноги. Мировые точки MediaPipe у каждой камеры уже в метрах и с началом в
+// тазу, поэтому калибровать сцену не нужно: ноги второй камеры достаточно
+// перенести на разницу таза (обычно сантиметры). Проверено на двух кропах
+// одного кадра: направления бедра и голени сходятся с полным кадром в
+// пределах 0–3°, длина ноги — в пределах 2 %.
+//
+// Что важно физически: обе камеры должны видеть пояс (таз) и стоять ровно,
+// без наклона. Наклон поворачивает мировые оси камеры, и ноги начнут «заваливаться».
+const FUSE_FRESH = 0.28; // с: поза второй камеры ещё про этот кадр
+const FUSE_LOWER = [25, 26, 27, 28, 29, 30, 31, 32]; // колени, стопы
+const fuseState = {
+  on: false,
+  offset: new THREE.Vector3(),
+  frames: 0,
+  at: 0,
+  why: '',
+};
+
+function fuseReset() {
+  fuseState.offset.set(0, 0, 0);
+  fuseState.frames = 0;
+  fuseState.on = false;
+  fuseState.at = 0;
+  state.legsSrc = 'cam1';
+  lmFilter.reset();
+  retargeter?.legGuard.reset();
+}
+
+function visOf(p) {
+  return p && Number.isFinite(p.visibility) ? p.visibility : 1;
+}
+
+// Возвращает мировые точки, где 0..24 — с первой камеры, 25..32 — со второй,
+// либо null, если слияние сейчас невозможно (тогда всё идёт с первой).
+function fuseLegs(worldA, nowMs) {
+  fuseState.why = '';
+  fuseState.on = false;
+  state.legsSrc = 'cam1';
+  if (!state.legsB) { fuseState.why = 'выкл'; return null; }
+  if (!obs.on) { fuseState.why = '2-я камера выключена'; return null; }
+  if (!obs.ready) { fuseState.why = '2-я модель грузится'; return null; }
+  const B = obs.world;
+  if (!B || B.length < 33 || !worldA || worldA.length < 33) {
+    fuseState.why = 'нет позы 2-й камеры';
+    return null;
+  }
+  if (nowMs - obs.at > FUSE_FRESH * 1000) {
+    fuseState.why = '2-я камера отстаёт';
+    return null;
+  }
+
+  const hipVisA = Math.min(visOf(worldA[23]), visOf(worldA[24]));
+  const hipVisB = Math.min(visOf(B[23]), visOf(B[24]));
+  if (hipVisA < 0.3) { fuseState.why = '1-я камера не видит таз'; return null; }
+  if (hipVisB < 0.35) { fuseState.why = '2-я камера не видит таз'; return null; }
+  const kneeVisB = Math.max(visOf(B[25]), visOf(B[26]));
+  if (kneeVisB < 0.4) { fuseState.why = '2-я камера не видит колени'; return null; }
+
+  // Смещение — только по тазу. Колени для этого не годятся: у первой камеры
+  // они часто «дорисованы» (верх тела в кадре, ног нет), и их разница утащила
+  // бы настоящие ноги за собой.
+  const wL = Math.min(visOf(worldA[23]), hipVisB);
+  const wR = Math.min(visOf(worldA[24]), hipVisB);
+  const wSum = wL + wR || 1;
+  const raw = new THREE.Vector3(
+    ((worldA[23].x - B[23].x) * wL + (worldA[24].x - B[24].x) * wR) / wSum,
+    ((worldA[23].y - B[23].y) * wL + (worldA[24].y - B[24].y) * wR) / wSum,
+    ((worldA[23].z - B[23].z) * wL + (worldA[24].z - B[24].z) * wR) / wSum,
+  );
+  // Скачок больше 25 см — это не калибровка, а сбой кадра: держим прежнее.
+  if (!fuseState.frames || raw.length() < 0.25) {
+    if (!fuseState.frames) fuseState.offset.copy(raw);
+    else fuseState.offset.lerp(raw, 0.25);
+  }
+  fuseState.frames++;
+  fuseState.at = nowMs;
+  fuseState.on = true;
+  state.legsSrc = 'cam2';
+
+  const out = worldA.slice();
+  for (const i of FUSE_LOWER) {
+    const p = B[i];
+    if (!p) continue;
+    out[i] = {
+      x: p.x + fuseState.offset.x,
+      y: p.y + fuseState.offset.y,
+      z: p.z + fuseState.offset.z,
+      visibility: p.visibility ?? 1,
+    };
+  }
+  return out;
+}
+
 function onPose(msg) {
   state.diagCount = msg.count;
   state.diagMs = msg.ms;
@@ -517,12 +621,24 @@ const poseRate = {
 };
 
 // Единый путь обработки: подходит и для камеры, и для тестового скелета
-function processWorld(raw, opts = {}) {
+function processWorld(rawIn, opts = {}) {
   const t = performance.now() / 1000;
   state.lastPoseAt = performance.now();
   // Точки кадра запоминаем до всех проверок: даже при потерянном теле телеметрия
   // должна видеть, где ноги в кадре (это про кадрирование, а не про позу).
   if (opts.image) lastImagePts = opts.image;
+
+  // Две камеры: верх — с первой, ноги — со второй. Слияние только здесь, чтобы
+  // и воркер, и главный поток (запасной путь) шли одинаково.
+  const wasFused = fuseState.on;
+  const fused = state.synthetic ? null : fuseLegs(rawIn, performance.now());
+  const raw = fused || rawIn;
+  // Переключение источника ног — это скачок точек: сбрасываем сглаживание и
+  // предохранитель один раз, иначе фильтр полсекунды «догоняет» новую ногу.
+  if (fuseState.on !== wasFused) {
+    lmFilter.reset();
+    retargeter?.legGuard.reset();
+  }
 
   let vis = 0;
   for (const i of TRACK_JOINTS) vis += raw[i].visibility ?? 1;
@@ -577,7 +693,9 @@ function processWorld(raw, opts = {}) {
       followFeet: state.followHips,
       rootMotion: state.rootMotion,
       guardPoints: guardPts,
-      image: opts.image,
+      // Предохранителю ног — кадр той камеры, с которой пришли ноги: «в кадре»
+      // и «размер ноги» считаются по её собственному кадру, иначе цифры врут.
+      image: fuseState.on ? (obs.image || opts.image) : opts.image,
       legGuard: state.legGuard,
       hands: opts.hands || null,
       t,
@@ -886,21 +1004,27 @@ function packFlat(arr) {
 // Кадр для модели. MediaPipe всё равно ресайзит вход под свою сеть, поэтому
 // подавать 1280×720 незачем: текстура вдвое больше — и вдвое дороже. Замер на
 // неподвижном кадре: 1000 px → 122 мс, 640 px → 65 мс.
-let inferCanvas = null;
-function frameSource(video) {
+// canvas'ов два: у камер две, и одна не должна затирать кадр другой, пока
+// createImageBitmap ещё копирует пиксели.
+const inferCanvases = {};
+function frameSource(video, key = 'a') {
   const w = video.videoWidth;
   const h = video.videoHeight;
   if (!w || !h) return null;
   const tw = CONFIG.inferWidth ? Math.min(CONFIG.inferWidth, w) : w;
   if (tw >= w) return video;
   const th = Math.max(1, Math.round((h * tw) / w));
-  if (!inferCanvas) inferCanvas = document.createElement('canvas');
-  if (inferCanvas.width !== tw || inferCanvas.height !== th) {
-    inferCanvas.width = tw;
-    inferCanvas.height = th;
+  let canvas = inferCanvases[key];
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    inferCanvases[key] = canvas;
   }
-  inferCanvas.getContext('2d').drawImage(video, 0, 0, tw, th);
-  return inferCanvas;
+  if (canvas.width !== tw || canvas.height !== th) {
+    canvas.width = tw;
+    canvas.height = th;
+  }
+  canvas.getContext('2d').drawImage(video, 0, 0, tw, th);
+  return canvas;
 }
 
 function pumpVideo() {
@@ -1147,12 +1271,20 @@ function updateHud() {
     }
     if (hintEl) {
       const h = g && retargeter.guardEnabled ? g.hint() : '';
-      hintEl.textContent = state.mode === 'clip'
-        ? 'Играется клип из файла — живой захват на паузе'
-        : (h || (legsEl.className === 'bad'
-          ? 'Ноги «держим»: модель не уверена в точках и держит последнюю позу'
-          : 'Ноги в порядке: колени и стопы идут с камеры'));
-      hintEl.className = h && state.mode !== 'clip' ? 'hint hot' : 'hint';
+      if (state.legsB && !obs.on) {
+        hintEl.textContent = 'Ноги с 1-й камеры, а она смотрит на верх: включите 2-ю камеру — она возьмёт ноги.';
+        hintEl.className = 'hint hot';
+      } else if (state.legsB && obs.on && !fuseState.on) {
+        hintEl.textContent = `Ноги с 1-й камеры: ${fuseState.why || 'вторая камера не даёт таз'}.`;
+        hintEl.className = 'hint hot';
+      } else {
+        hintEl.textContent = state.mode === 'clip'
+          ? 'Играется клип из файла — живой захват на паузе'
+          : (h || (legsEl.className === 'bad'
+            ? 'Ноги «держим»: модель не уверена в точках и держит последнюю позу'
+            : `Ноги в порядке: колени и стопы идут ${fuseState.on ? 'со 2-й камеры' : 'с камеры'}`));
+        hintEl.className = h && state.mode !== 'clip' ? 'hint hot' : 'hint';
+      }
     }
   }
 
@@ -1175,9 +1307,12 @@ function updateHud() {
 
   // Кадрирование: где тело в кадре и сколько запаса до краёв. Главная причина
   // поломанных ног — не модель, а край кадра, поэтому это видно всегда.
+  // В двухкамерной схеме первая камера отвечает только за верх.
   const fInfo = $('frameInfo');
   if (fInfo) {
-    const f = state.mode === 'live' && !state.synthetic ? framingReport() : null;
+    const f = state.mode === 'live' && !state.synthetic
+      ? framingReport(undefined, undefined, { upperOnly: fuseState.on })
+      : null;
     const v = framingVerdict(f);
     fInfo.textContent = v.info;
     fInfo.className = v.level === 'bad' ? 'bad' : v.level === 'tight' ? 'hot' : v.level === 'ok' ? 'ok' : '';
@@ -1187,6 +1322,24 @@ function updateHud() {
       fHint.className = 'hint' + (v.level && v.level !== 'ok' ? ' hot' : '');
     }
     drawFrameBox(f, v.level);
+  }
+
+  // Источник ног: одна камера или вторая. Видно сразу, работает ли слияние.
+  const srcEl = $('legsSrc');
+  if (srcEl) {
+    if (!state.legsB) {
+      srcEl.textContent = obs.on ? '1 (слияние выкл)' : '1 (одна камера)';
+      srcEl.className = '';
+    } else if (!obs.on) {
+      srcEl.textContent = '1 (2-я камера выкл)';
+      srcEl.className = '';
+    } else if (fuseState.on) {
+      srcEl.textContent = '2 (ноги и стопы)';
+      srcEl.className = 'ok';
+    } else {
+      srcEl.textContent = `1 · ${fuseState.why || 'нет данных'}`;
+      srcEl.className = 'hot';
+    }
   }
 
   // 2-я камера: те же цифры, что у первой — доверие ногам, размер ноги в кадре,
@@ -1234,12 +1387,13 @@ function updateHud() {
 
   const bHint = $('camBHint');
   if (bHint) {
-    const fB = obs.on && obs.ready ? framingReport(obs.image, obs.history) : null;
-    const vB = framingVerdict(fB);
+    const fB = obs.on && obs.ready ? legsReport(obs.image) : null;
+    const vB = legsVerdict(fB);
     let line = vB.hint;
     if (obs.err) line = shortError(obs.err);
-    else if (!obs.on) line = '2-я камера только смотрит: персонажем управляет первая';
+    else if (!obs.on) line = 'Включите 2-ю камеру: она возьмёт ноги и стопы';
     else if (!obs.ready) line = 'Гружу вторую модель MediaPipe…';
+    else if (state.legsB && !fuseState.on) line = `Ноги сейчас с 1-й камеры: ${fuseState.why || 'нет данных'}`;
     if (bHint.textContent !== line) bHint.textContent = line;
     bHint.className = 'hint' + (obs.on && vB.level && vB.level !== 'ok' ? ' hot' : '');
     drawFrameBox(fB, vB.level, 'frameBoxB');
@@ -1247,13 +1401,23 @@ function updateHud() {
 
   const bDiff = $('camBDiff');
   if (bDiff) {
-    const both = obs.on && obs.at && lastGuardPts && cam1Leg.l > 0 && obs.legLen.l > 0;
-    if (!both) {
-      if (bDiff.textContent !== '—') bDiff.textContent = '—';
-    } else {
-      const cm = (m) => Math.round(m * 100); // точки в метрах
-      const text = `L ${cm(cam1Leg.l)}/${cm(obs.legLen.l)} · R ${cm(cam1Leg.r)}/${cm(obs.legLen.r)}`;
+    if (fuseState.on) {
+      // Сравнивать нечего: первая камера ног не видит. Показываем длину ноги,
+      // по которой реально строится IK.
+      const cm = (m) => Math.round(m * 100);
+      const text = obs.legLen.l > 0
+        ? `L ${cm(obs.legLen.l)} · R ${cm(obs.legLen.r)} (2-я)`
+        : '—';
       if (bDiff.textContent !== text) bDiff.textContent = text;
+    } else {
+      const both = obs.on && obs.at && lastGuardPts && cam1Leg.l > 0 && obs.legLen.l > 0;
+      if (!both) {
+        if (bDiff.textContent !== '—') bDiff.textContent = '—';
+      } else {
+        const cm = (m) => Math.round(m * 100); // точки в метрах
+        const text = `L ${cm(cam1Leg.l)}/${cm(obs.legLen.l)} · R ${cm(cam1Leg.r)}/${cm(obs.legLen.r)}`;
+        if (bDiff.textContent !== text) bDiff.textContent = text;
+      }
     }
   }
 
@@ -1314,10 +1478,15 @@ const SAFE_EDGE = 0.05; // минимальный запас до края, до
 const FRAME_MEMORY = 5000; // мс: помним худший запас за это время
 let frameHistory = [];
 
-function framingReport(pts = lastImagePts, history = frameHistory) {
+function framingReport(pts = lastImagePts, history = frameHistory, opts = {}) {
   if (!pts || pts.length < 33) return null;
+  // Верх тела без ног: низ — по тазу, а не по дорисованным ступням, и края
+  // считаем только по верхним точкам (ноги в этот кадр не входят).
+  const upperOnly = !!opts.upperOnly;
+  const lastIdx = upperOnly ? 24 : 32;
   let minX = 1, maxX = 0, minY = 1, maxY = 0, n = 0, out = 0;
-  for (const p of pts) {
+  for (let i = 0; i <= lastIdx; i++) {
+    const p = pts[i];
     if (!p || (p.visibility ?? 1) < 0.5) continue;
     n++;
     if (p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) out++;
@@ -1329,11 +1498,17 @@ function framingReport(pts = lastImagePts, history = frameHistory) {
   const nose = pts[0];
   if (n < 10 || !nose || (nose.visibility ?? 1) < 0.5) return null;
 
-  // низ тела — самая низкая из видимых точек стоп
   let soleY = nose.y;
-  for (const i of [29, 30, 31, 32, 27, 28]) {
-    const p = pts[i];
-    if (p && (p.visibility ?? 1) >= 0.5 && p.y > soleY) soleY = p.y;
+  if (upperOnly) {
+    for (const i of [23, 24]) {
+      const p = pts[i];
+      if (p && (p.visibility ?? 1) >= 0.5 && p.y > soleY) soleY = p.y;
+    }
+  } else {
+    for (const i of [29, 30, 31, 32, 27, 28]) {
+      const p = pts[i];
+      if (p && (p.visibility ?? 1) >= 0.5 && p.y > soleY) soleY = p.y;
+    }
   }
   const H = Math.max(0.01, soleY - nose.y);
   // макушка выше носа и подошва ниже носка — точки в 33 landmark'ах не отдают
@@ -1342,6 +1517,7 @@ function framingReport(pts = lastImagePts, history = frameHistory) {
   const f = {
     n,
     out,
+    upperOnly,
     body: r3(sole - top), // сколько кадра занимает человек целиком
     top: r3(top),
     bottom: r3(1 - sole),
@@ -1366,6 +1542,7 @@ function framingReport(pts = lastImagePts, history = frameHistory) {
 
 // Что сказать человеку. Уровень: ok / tight / bad — тот же цвет в HUD и на схеме.
 function framingVerdict(f) {
+  if (f?.upperOnly) return upperVerdict(f);
   const fit = 1 - 2 * SAFE_EDGE; // 0.9 кадра — предел с запасом 5 % по краям
   const pct = (v) => `${Math.round(Math.max(0, v) * 100)} %`;
   if (!f) {
@@ -1433,6 +1610,120 @@ function framingVerdict(f) {
     hint: wasTight
       ? 'В стойке запас есть, но в движении край близко: чуть дальше — и шаг перестанет выходить за кадр.'
       : 'Всё тело в кадре с запасом — ноги не ломаются.',
+  };
+}
+
+// Верх тела в кадре: в двухкамерной схеме первая камера не обязана вмещать
+// ноги, поэтому «отойдите дальше» здесь не совет, а вред. Смотрим на то, что
+// действительно должно быть в кадре: макушка, кисти, локти и таз (по нему ноги
+// привязываются ко второй камере).
+function upperVerdict(f) {
+  const pct = (v) => `${Math.round(Math.max(0, v) * 100)} %`;
+  const tight = (v) => v < SAFE_EDGE;
+  if (f.out > 0) {
+    return {
+      level: 'bad',
+      info: `верх ${pct(f.body)} · за краем`,
+      hint: 'Верх тела выходит за край: отодвиньте камеру 1 или разверните её — срезанные кисти и локти модель дорисует.',
+    };
+  }
+  if (tight(f.top)) {
+    return {
+      level: 'tight',
+      info: `верх ${pct(f.body)} · сверху ${pct(f.top)}`,
+      hint: 'Голова у верхнего края: опустите камеру 1 или наклоните её выше.',
+    };
+  }
+  if (tight(f.bottom)) {
+    return {
+      level: 'tight',
+      info: `верх ${pct(f.body)} · таз снизу ${pct(f.bottom)}`,
+      hint: 'Таз у нижнего края: поднимите камеру 1 или наклоните её ниже — по тазу ноги привязываются ко второй камере.',
+    };
+  }
+  if (Math.min(f.left, f.right) < SAFE_EDGE * 0.6) {
+    return {
+      level: 'tight',
+      info: `по бокам ${pct(Math.min(f.left, f.right))}`,
+      hint: 'Кисти почти у края кадра: отодвиньте камеру 1 или разверните её — пальцы считаются по этому кадру.',
+    };
+  }
+  return {
+    level: 'ok',
+    info: `верх ${pct(f.body)} кадра · сверху ${pct(f.top)} · таз ${pct(f.bottom)}`,
+    hint: 'Верх в кадре: голова, кисти и таз видны.',
+  };
+}
+
+// Ноги в кадре второй камеры: таз сверху, стопы снизу. Отдельно от общей
+// схемы, потому что голова и руки в этот кадр не входят (и не должны).
+function legsReport(pts = obs.image) {
+  if (!pts || pts.length < 33) return null;
+  const hip = [pts[23], pts[24]].filter((p) => p && visOf(p) >= 0.45);
+  const feet = [27, 28, 29, 30, 31, 32].map((i) => pts[i]).filter((p) => p && visOf(p) >= 0.5);
+  if (!hip.length || !feet.length) return null;
+  // Всё, что ниже таза: колени и лодыжки тоже должны быть в кадре, а не только
+  // стопы — иначе «ноги в порядке», хотя колено срезано.
+  const lower = [];
+  for (let i = 25; i <= 32; i++) {
+    if (pts[i] && visOf(pts[i]) >= 0.45) lower.push(pts[i]);
+  }
+  const all = [...hip, ...lower];
+  let x0 = 1, x1 = 0, y0 = 1, y1 = 0;
+  for (const p of all) {
+    x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x);
+    y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y);
+  }
+  return {
+    n: all.length,
+    out: all.filter((p) => p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1).length,
+    body: r3(y1 - y0),
+    top: r3(y0), // запас над тазом
+    bottom: r3(1 - y1), // запас под стопами
+    left: r3(x0),
+    right: r3(1 - x1),
+    box: [r3(x0), r3(y0), r3(x1), r3(y1)],
+    legs: true,
+  };
+}
+
+function legsVerdict(f) {
+  const pct = (v) => `${Math.round(Math.max(0, v) * 100)} %`;
+  if (!f) {
+    return { level: '', info: 'нет данных', hint: 'Ноги не видны: проверьте свет и что камера 2 смотрит на ноги.' };
+  }
+  if (f.out > 0) {
+    return {
+      level: 'bad',
+      info: `${pct(f.body)} кадра · за краем`,
+      hint: 'Ноги выходят за край: отодвиньте камеру 2 или разверните её — ступни должны быть видны целиком.',
+    };
+  }
+  if (f.top < SAFE_EDGE) {
+    return {
+      level: 'tight',
+      info: `сверху ${pct(f.top)} · ноги ${pct(f.body)}`,
+      hint: 'Пояс у верхнего края: камера 2 должна видеть таз — поднимите её или наклоните выше.',
+    };
+  }
+  if (f.bottom < SAFE_EDGE) {
+    return {
+      level: 'tight',
+      info: `снизу ${pct(f.bottom)} · ноги ${pct(f.body)}`,
+      hint: 'Стопы у нижнего края: опустите камеру 2 или наклоните её ниже — на шаге ступня выйдет за край.',
+    };
+  }
+  if (Math.min(f.left, f.right) < SAFE_EDGE * 0.6) {
+    return {
+      level: 'tight',
+      info: `по бокам ${pct(Math.min(f.left, f.right))}`,
+      hint: 'Стопы почти у края: чуть дальше или разверните камеру 2.',
+    };
+  }
+  return {
+    level: 'ok',
+    info: `ноги ${pct(f.body)} · сверху ${pct(f.top)} · снизу ${pct(f.bottom)}`,
+    hint: 'Ноги в кадре с запасом — колени и стопы идут с камеры 2.',
   };
 }
 
@@ -1515,18 +1806,19 @@ function telemetryPayload(now) {
     // Кадрирование: запас до краёв кадра и вердикт (ok/tight/bad) — то, что
     // решает, будут ли ноги целыми.
     frame: (() => {
-      const f = framingReport();
+      const f = framingReport(undefined, undefined, { upperOnly: fuseState.on });
       const v = framingVerdict(f);
       return f ? { ...f, level: v.level } : null;
     })(),
-    // Длина ноги «бедро + голень» (м) по камере 1 — с ней сравнивается вторая.
+    // Длина ноги «бедро + голень» (м): по камере 1 или по слитой позе.
     legLen: { l: r3(cam1Leg.l), r: r3(cam1Leg.r) },
-    // 2-я камера: наблюдатель. Свои цифры, чтобы потом решать по ним, а не по
-    // ощущению «вроде лучше».
+    // Источник ног: cam1 (одна камера) или cam2 (слияние). why — почему не вышло.
+    legs: { src: state.legsSrc, on: fuseState.on, why: fuseState.why || null, offset: +fuseState.offset.length().toFixed(3) },
+    // 2-я камера: ноги, своё кадрирование и длина ноги.
     cam2: (() => {
       if (!obs.on) return null;
-      const fB = framingReport(obs.image || [], obs.history);
-      const vB = framingVerdict(fB);
+      const fB = legsReport(obs.image);
+      const vB = legsVerdict(fB);
       return {
         on: true,
         ready: obs.ready,
@@ -1737,11 +2029,19 @@ async function turnOnCamera() {
   updateHud();
 }
 
-// ---------- вторая камера: наблюдатель ----------
-// Пока НЕ управляет персонажем. Цель — увидеть по числам, что она реально даёт,
-// и только потом решать про слияние. Поэтому у неё своя модель MediaPipe (свой
-// воркер), свой предохранитель ног и своё кадрирование: иначе «лучше/хуже»
-// решается на глаз, а не по цифрам.
+// ---------- вторая камера: ноги ----------
+// В двухкамерном режиме она отдаёт колени и стопы (см. fuseLegs выше), а в
+// однокамерном остаётся наблюдателем: свои цифры доверия ногам, длины ног и
+// кадрирования. У неё своя модель MediaPipe (свой воркер) — иначе «лучше/хуже»
+// решается на глаз, а не по числам.
+// 15 к/с для камеры ног: на одном GPU каждый проход модели конкурирует с телом
+// и кистями, а ноги в 15 к/с не теряют ничего.
+const OBS_MIN_INTERVAL = (() => {
+  const v = Number(new URLSearchParams(location.search).get('cam2fps'));
+  const fps = Number.isFinite(v) && v >= 5 && v <= 60 ? v : 15;
+  return 1000 / fps;
+})();
+
 const obs = {
   on: false,
   video: null,
@@ -1754,6 +2054,7 @@ const obs = {
   pending: false,
   deviceId: '',
   lastVideoTime: -1,
+  sentAt: 0,
   guard: new LegGuard(),
   world: null,
   image: null,
@@ -1847,8 +2148,13 @@ function pumpObserver() {
   // В режиме клипа персонажем управляет анимация — вторая камера не нужна,
   // и её воркер не должен занимать GPU.
   if (state.mode === 'clip' || obs.pending || !obs.worker) return;
+  // Ноги не требуют 30 к/с, а каждый кадр второй камеры — это ещё один проход
+  // модели на том же GPU. Держим 15 к/с: телу и кистям остаётся больше.
+  const now = performance.now();
+  if (obs.sentAt && now - obs.sentAt < OBS_MIN_INTERVAL) return;
   obs.pending = true;
-  const src = frameSource(v);
+  obs.sentAt = now;
+  const src = frameSource(v, 'b');
   if (!src) { obs.pending = false; return; }
   createImageBitmap(src).then((bitmap) => {
     obs.worker?.postMessage({ type: 'frame', bitmap, ts: performance.now() }, [bitmap]);
@@ -1880,6 +2186,7 @@ async function turnOnCameraB() {
     obs.err = '';
     obs.deviceId = id || '';
     obs.lastVideoTime = -1;
+    obs.sentAt = 0;
     obs.guard.reset();
     obs.history = [];
     obs.legLen = { l: 0, r: 0 };
@@ -1887,9 +2194,17 @@ async function turnOnCameraB() {
     obs.fpsTime = 0;
     obs.fps = 0;
     obs.at = 0;
+    fuseReset();
+    // Две камеры включены — по умолчанию ноги идут со второй. ?legs=cam1
+    // оставляет её наблюдателем, не трогая галочку.
+    if (LEGS_MODE !== 'cam1') {
+      state.legsB = true;
+      if ($('chkLegsB')) $('chkLegsB').checked = true;
+    }
     $('camB')?.classList.add('on');
     obsStartWorker(); // вторая модель MediaPipe — только когда камера уже открылась
-    log(`2-я камера: ${cam.label} ${cam.width}x${cam.height}`);
+    log(`2-я камера: ${cam.label} ${cam.width}x${cam.height}`
+      + (state.legsB ? ' · ноги с неё' : ' · наблюдатель'));
     await refreshCameras();
   } catch (err) {
     obs.err = describeCameraError(err);
@@ -1912,9 +2227,11 @@ function stopObserver() {
   obs.world = null;
   obs.image = null;
   obs.at = 0;
+  obs.sentAt = 0;
   obs.legLen = { l: 0, r: 0 };
   obs.history = [];
   obs.guard.reset();
+  fuseReset();
   $('camB')?.classList.remove('on');
   const btn = $('btnCamB');
   if (btn) btn.textContent = 'Включить 2-ю камеру';
@@ -1968,6 +2285,8 @@ function jsonMeta() {
     mirror: state.mirror,
     zGain: state.zGain,
     model: state.modelUrl || 'fallback',
+    // С какой камеры пришли ноги: по этому видно, что съёмка была двухкамерной.
+    legs: state.legsSrc,
     quality: {
       contacts: q.contacts,
       contactSeconds: q.contactSeconds,
@@ -2419,7 +2738,7 @@ function wireUi() {
     if (state.camState !== 'ok') return;
     // Вторая камера могла занять именно это устройство — освобождаем его.
     if (obs.on && obs.deviceId && obs.deviceId === $('camPick').value) {
-      log('2-я камера: устройство занято первой камерой — выключаю наблюдателя');
+      log('2-я камера: устройство занято первой камерой — выключаю вторую');
       stopObserver();
     }
     stopCamera(camStream);
@@ -2484,6 +2803,19 @@ function wireUi() {
     log(state.hands
       ? 'Кисти включены: пальцы идут с камеры'
       : 'Кисти выключены: пальцы держат последнюю позу');
+  });
+  if ($('chkLegsB')) $('chkLegsB').checked = state.legsB;
+  $('chkLegsB')?.addEventListener('change', (e) => {
+    state.legsB = e.target.checked;
+    fuseState.why = '';
+    if (!state.legsB) {
+      fuseReset();
+      log('Ноги с 1-й камеры: вторая камера только смотрит');
+    } else {
+      log(obs.on
+        ? 'Ноги со 2-й камеры: колени и стопы идут с неё'
+        : 'Ноги со 2-й камеры: включите её кнопкой ниже');
+    }
   });
   $('chkLegGuard').addEventListener('change', (e) => {
     state.legGuard = e.target.checked;
@@ -2657,7 +2989,12 @@ async function resolveModelPath() {
     qualityReport,
     framingReport,
     framingVerdict,
-    // 2-я камера-наблюдатель: цифры и отладочные входы
+    legsReport,
+    legsVerdict,
+    upperVerdict,
+    fuseLegs,
+    fuseState,
+    // 2-я камера (ноги): цифры и отладочные входы
     obs,
     turnOnCameraB,
     stopObserver,

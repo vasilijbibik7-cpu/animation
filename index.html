@@ -116,17 +116,20 @@
   <hr>
   <select id="camPick" title="Камера"></select>
   <button id="btnCam">Включить камеру</button>
-  <div class="row"><span class="k">Камера 2 (наблюдатель)</span><span id="camBState">выкл</span></div>
-  <select id="camPickB" title="Вторая камера"></select>
+  <div class="row"><span class="k">Камера 2 (ноги)</span><span id="camBState">выкл</span></div>
+  <select id="camPickB" title="Вторая камера — на ноги"></select>
   <button id="btnCamB">Включить 2-ю камеру</button>
+  <label class="chk"><input type="checkbox" id="chkLegsB"> Ноги со 2-й камеры</label>
+  <div class="row"><span class="k">Ноги с камеры</span><span id="legsSrc">1</span></div>
+  <div class="hint">Обе камеры должны видеть пояс (таз) и стоять ровно, без наклона: по тазу ноги привязываются к телу.</div>
   <div class="frame">
     <canvas id="frameBoxB" width="192" height="108"></canvas>
     <div class="txt">
       <div id="camBInfo">—</div>
-      <div id="camBHint" class="hint">2-я камера только смотрит: персонажем управляет первая</div>
+      <div id="camBHint" class="hint">Включите 2-ю камеру: она возьмёт ноги и стопы</div>
     </div>
   </div>
-  <div class="row"><span class="k">Нога, см (1/2)</span><span id="camBDiff">—</span></div>
+  <div class="row"><span class="k">Нога, см</span><span id="camBDiff">—</span></div>
   <button id="btnTest">Тест без камеры</button>
   <button id="btnPlay">Проиграть клип FBX</button>
   <button id="btnCal">Перекалибровать</button>
@@ -205,7 +208,7 @@
 <div id="camB">
   <video id="video2" playsinline muted></video>
   <canvas id="overlayB" width="320" height="240"></canvas>
-  <div class="tag">камера 2 · наблюдатель</div>
+  <div class="tag">камера 2 · ноги</div>
 </div>
 
 <div id="count"></div>

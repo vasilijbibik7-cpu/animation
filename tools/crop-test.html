@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Crop test</title>
+<style>
+  body { background:#111; color:#ddd; font: 12px/1.4 monospace; margin: 0; padding: 8px; }
+  canvas { border: 1px solid #444; vertical-align: top; margin: 4px; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<pre id="out">загрузка…</pre>
+<div id="views"></div>
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from '../vendor/mediapipe/vision_bundle.mjs';
+import { installGlue } from '../src/mp-glue.js';
+
+const WASM = '/vendor/mediapipe/wasm';
+const MODEL = '/vendor/models/pose_landmarker_full.task';
+const KEY = [0, 11, 12, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+
+const out = (t) => { document.getElementById('out').textContent = t; };
+const r3 = (v) => (v == null ? null : +v.toFixed(3));
+const r1 = (v) => (v == null ? null : +v.toFixed(1));
+
+async function makeLandmarker() {
+  await installGlue(WASM);
+  const vision = await FilesetResolver.forVisionTasks(WASM);
+  const opts = (d) => ({
+    baseOptions: { modelAssetPath: MODEL, delegate: d },
+    runningMode: 'IMAGE',
+    numPoses: 1,
+    minPoseDetectionConfidence: 0.3,
+    minPosePresenceConfidence: 0.3,
+  });
+  try { return await PoseLandmarker.createFromOptions(vision, opts('GPU')); }
+  catch { return await PoseLandmarker.createFromOptions(vision, opts('CPU')); }
+}
+
+function cropCanvas(img, rect, scale = 1) {
+  const sx = Math.round(rect.x * img.naturalWidth);
+  const sy = Math.round(rect.y * img.naturalHeight);
+  const sw = Math.round(rect.w * img.naturalWidth);
+  const sh = Math.round(rect.h * img.naturalHeight);
+  const c = document.createElement('canvas');
+  c.width = Math.round(sw * scale);
+  c.height = Math.round(sh * scale);
+  c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  return c;
+}
+
+// Угол в плоскости кадра: наклон бедра/голени/стопы. По нему видно, сохранилась
+// ли форма ноги на кропе (сравниваем с полным кадром, ракурс один и тот же).
+function segAngles(lm) {
+  const a = (i, j) => {
+    const dx = lm[j].x - lm[i].x;
+    const dy = lm[j].y - lm[i].y;
+    return r1((Math.atan2(dy, dx) * 180) / Math.PI);
+  };
+  return { thighL: a(23, 25), shinL: a(25, 27), thighR: a(24, 26), shinR: a(26, 28) };
+}
+
+function summary(res, kinds) {
+  const lm = res.landmarks?.[0];
+  const w = res.worldLandmarks?.[0];
+  if (!lm) return { found: false };
+  const o = { found: true, n: lm.length, img: {}, world: {} };
+  for (const i of KEY) {
+    o.img[i] = { x: r3(lm[i].x), y: r3(lm[i].y), z: r3(lm[i].z), v: r3(lm[i].visibility) };
+    o.world[i] = { x: r3(w[i].x), y: r3(w[i].y), z: r3(w[i].z), v: r3(w[i].visibility) };
+  }
+  o.angles = segAngles(lm);
+  o.legLen = {
+    l: r3(Math.hypot(w[25].x - w[23].x, w[25].y - w[23].y, w[25].z - w[23].z)
+      + Math.hypot(w[27].x - w[25].x, w[27].y - w[25].y, w[27].z - w[25].z)),
+    r: r3(Math.hypot(w[26].x - w[24].x, w[26].y - w[24].y, w[26].z - w[24].z)
+      + Math.hypot(w[28].x - w[26].x, w[28].y - w[26].y, w[28].z - w[26].z)),
+  };
+  o.hipPx = r1(Math.hypot((lm[23].x - lm[24].x) * kinds.w, (lm[23].y - lm[24].y) * kinds.h));
+  return o;
+}
+
+try {
+  out('гружу модель…');
+  const lmk = await makeLandmarker();
+  out('гружу картинку…');
+  const img = new Image();
+  img.src = '/assets/test-pose.jpg';
+  await img.decode();
+
+  const views = document.getElementById('views');
+  const rects = {
+    full: { x: 0.14, y: 0.24, w: 0.72, h: 0.74 },
+    upper: { x: 0.18, y: 0.26, w: 0.64, h: 0.40 },
+    upperTight: { x: 0.24, y: 0.27, w: 0.52, h: 0.34 },
+    legs: { x: 0.15, y: 0.45, w: 0.70, h: 0.54 },
+    legsTight: { x: 0.20, y: 0.50, w: 0.60, h: 0.49 },
+  };
+  const result = {};
+  for (const [name, rect] of Object.entries(rects)) {
+    const c = cropCanvas(img, rect, name === 'full' ? 0.8 : 1.6);
+    views.appendChild(c);
+    const t0 = performance.now();
+    const res = lmk.detect(c);
+    const ms = performance.now() - t0;
+    result[name] = {
+      ...summary(res, { w: c.width, h: c.height }),
+      ms: Math.round(ms),
+      crop: { w: c.width, h: c.height },
+    };
+  }
+  // ---- слияние: верх с cam1, ноги с cam2 ----
+  // Так же, как в приложении: таз берём у верхней камеры, колени/стопы — у
+  // нижней, всё остальное — у верхней. Проверяем, что направления ног при этом
+  // совпадают с полным кадром (он тут эталон: тот же ракурс).
+  const U = result.upper, L = result.legs, F = result.full;
+  const fused = new Array(33).fill(null);
+  for (let i = 0; i < 33; i++) {
+    const src = i >= 25 ? L : U;
+    fused[i] = src.world[i] || null;
+  }
+  // таз: у кого видимость выше
+  for (const i of [23, 24]) {
+    const a = U.world[i], b = L.world[i];
+    fused[i] = (a?.v ?? 0) >= (b?.v ?? 0) ? a : b;
+  }
+  const ang = (arr, i, j) => {
+    const dx = arr[j].x - arr[i].x;
+    const dy = arr[j].y - arr[i].y;
+    return r1((Math.atan2(dy, dx) * 180) / Math.PI);
+  };
+  const ref = (i, j) => {
+    const dx = F.world[j].x - F.world[i].x;
+    const dy = F.world[j].y - F.world[i].y;
+    return r1((Math.atan2(dy, dx) * 180) / Math.PI);
+  };
+  const diff = (a, b) => r1(Math.abs(a - b));
+  result.fusion = {
+    thighL: ang(fused, 23, 25), thighLref: ref(23, 25),
+    shinL: ang(fused, 25, 27), shinLref: ref(25, 27),
+    thighR: ang(fused, 24, 26), thighRref: ref(24, 26),
+    shinR: ang(fused, 26, 28), shinRref: ref(26, 28),
+    errThighL: diff(ang(fused, 23, 25), ref(23, 25)),
+    errShinL: diff(ang(fused, 25, 27), ref(25, 27)),
+    errThighR: diff(ang(fused, 24, 26), ref(24, 26)),
+    errShinR: diff(ang(fused, 26, 28), ref(26, 28)),
+    legLenL: r3(Math.hypot(fused[25].x - fused[23].x, fused[25].y - fused[23].y, fused[25].z - fused[23].z)
+      + Math.hypot(fused[27].x - fused[25].x, fused[27].y - fused[25].y, fused[27].z - fused[25].z)),
+    legLenRef: F.legLen.l,
+    hipGap: r3(Math.hypot(fused[23].x - L.world[23].x, fused[23].y - L.world[23].y, fused[23].z - L.world[23].z)),
+  };
+  window.__result = result;
+  out(JSON.stringify(result.fusion, null, 1));
+} catch (err) {
+  out('ОШИБКА: ' + (err?.stack || err));
+  window.__result = { error: String(err?.stack || err) };
+}
+</script>
+</body>
+</html>
