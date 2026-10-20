@@ -30,6 +30,16 @@ export const BONE_KEYS = {
   rToe: 'RightToeBase',
 };
 
+// Пальцы: 4 кости на палец (у большого тоже 4), 5 пальцев на руку.
+// Короткие ключи: lThumb1 … rPinky4 — по ним же строятся цели ретаргета.
+export const FINGER_NAMES = ['Thumb', 'Index', 'Middle', 'Ring', 'Pinky'];
+for (const side of ['Left', 'Right']) {
+  const s = side === 'Left' ? 'l' : 'r';
+  for (const f of FINGER_NAMES) {
+    for (let j = 1; j <= 4; j++) BONE_KEYS[`${s}${f}${j}`] = `${side}Hand${f}${j}`;
+  }
+}
+
 export function findRig(root) {
   const bones = [];
   root.traverse((o) => { if (o.isBone) bones.push(o); });
@@ -64,7 +74,13 @@ export function captureRest(root, rig) {
   });
 
   for (const [key, bone] of Object.entries(rig)) {
-    const child = bone.children.find((c) => c.isBone);
+    let child = bone.children.find((c) => c.isBone);
+    // Кисть: направление задаёт ладонь (запястье → основание среднего пальца),
+    // а не первый ребёнок — у Mixamo это большой палец.
+    if (key === 'lHand' || key === 'rHand') {
+      const mid = rig[key[0] + 'Middle1'];
+      if (mid) child = mid;
+    }
     const worldPos = new THREE.Vector3().setFromMatrixPosition(bone.matrixWorld);
     const parentWorldQuat = bone.parent ? worldQuatOf(bone.parent) : new THREE.Quaternion();
 

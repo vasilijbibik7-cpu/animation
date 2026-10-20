@@ -64,6 +64,7 @@ export function retargetTake(data, {
   // Корень и масштаб — с нуля: иначе первая поза «прыгнет» из того места, где
   // камера закончила, и корневое движение поедет не от нуля.
   retargeter.resetRoot();
+  retargeter.resetHands?.();
 
   const prevWarmup = recorder.warmup;
   const prevMax = recorder.maxSeconds;

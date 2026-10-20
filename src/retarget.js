@@ -18,6 +18,20 @@ import { LegGuard } from './legs.js';
 // щёлкает одним суставом.
 const SPINE_SPLIT = [['spine', 0.5], ['spine1', 0.8], ['spine2', 1.0]];
 
+// Кисти: 21 точка HandLandmarker → кости пальцев. 0 — запястье, дальше по
+// четыре точки на палец: основание, средний сустав, кончик. Четвёртая кость
+// пальца у Mixamo — концевая, для неё точки нет, она остаётся в rest.
+const HAND_CHAINS = [
+  ['Thumb', [1, 2, 3, 4]],
+  ['Index', [5, 6, 7, 8]],
+  ['Middle', [9, 10, 11, 12]],
+  ['Ring', [13, 14, 15, 16]],
+  ['Pinky', [17, 18, 19, 20]],
+];
+
+// Пальцы короткие, а точки кисти дрожат: без сглаживания палец трясётся на месте.
+const FINGER_SMOOTH = 0.55;
+
 // Индексы точек MediaPipe Pose (33 шт.)
 export const MP = {
   nose: 0,
@@ -52,6 +66,14 @@ export class Retargeter {
     this.restLocal = new Map();
     this._keys = new Map();
     for (const [k, b] of Object.entries(rig)) this._keys.set(b, k);
+    // Кисти и пальцы: когда свежих точек нет, эти кости держат прошлую позу,
+    // а не прыгают в rest (кисть легко выходит из кадра).
+    this.handKeys = new Set(Object.keys(rig).filter(
+      (k) => k === 'lHand' || k === 'rHand' || /^(l|r)(Thumb|Index|Middle|Ring|Pinky)[1-3]$/.test(k),
+    ));
+    this.fingerKeys = new Set(Object.keys(rig).filter(
+      (k) => /^(l|r)(Thumb|Index|Middle|Ring|Pinky)[1-3]$/.test(k),
+    ));
 
     this.modelRoot = null;
     this.scaleK = 1; // «метры человека» → «единицы модели»
@@ -165,6 +187,16 @@ export class Retargeter {
     }
     this.modelRoot.updateMatrixWorld(true);
     return moving;
+  }
+
+  // В JSON лежат только точки тела: кистей там нет. Перед импортом ставим
+  // кисти в rest, иначе в кадры запишется случайная поза с камеры.
+  resetHands() {
+    for (const key of this.handKeys) {
+      const bone = this.rig[key];
+      const rl = bone && this.restLocal.get(bone);
+      if (rl) bone.quaternion.copy(rl);
+    }
   }
 
   resetRoot() {    this.rootMotion.reset();
@@ -285,6 +317,25 @@ export class Retargeter {
       }
     }
 
+    // ---- кисти: ладонь и пальцы (отдельная модель HandLandmarker) ----
+    // Точки кисти уже переведены в оси three.js так же, как точки тела, поэтому
+    // здесь только направления: положение кисти задаёт рука.
+    if (opts.hands) {
+      for (const side of ['l', 'r']) {
+        const h = opts.hands[side];
+        if (!h || h.length < 21) continue;
+        const hd = (a, b) => new THREE.Vector3(
+          h[b].x - h[a].x, h[b].y - h[a].y, h[b].z - h[a].z,
+        ).normalize();
+        targets[side + 'Hand'] = hd(0, 9); // ладонь: запястье → основание среднего
+        for (const [name, p] of HAND_CHAINS) {
+          targets[side + name + '1'] = hd(p[0], p[1]);
+          targets[side + name + '2'] = hd(p[1], p[2]);
+          targets[side + name + '3'] = hd(p[2], p[3]);
+        }
+      }
+    }
+
     // ---- базис таза: x — ось бёдер, y — вверх по корпусу ----
     const xAxis = new THREE.Vector3(
       P(MP.lHip).x - P(MP.rHip).x,
@@ -320,7 +371,13 @@ export class Retargeter {
           .applyQuaternion(parentQ.clone().invert())
           .normalize();
         tmpQ.setFromUnitVectors(rest[key].dirParent, dTargetParent);
-        bone.quaternion.copy(tmpQ).multiply(restLocal);
+        tmpQ.multiply(restLocal);
+        // Пальцы сглаживаем: соседние кадры кисти дрожат, палец короткий.
+        if (this.fingerKeys.has(key)) bone.quaternion.slerp(tmpQ, FINGER_SMOOTH);
+        else bone.quaternion.copy(tmpQ);
+        worldQ.set(bone, parentQ.clone().multiply(bone.quaternion));
+      } else if (key && this.handKeys.has(key)) {
+        // Свежих точек кисти нет — держим прошлую позу, а не rest.
         worldQ.set(bone, parentQ.clone().multiply(bone.quaternion));
       } else {
         bone.quaternion.copy(restLocal);

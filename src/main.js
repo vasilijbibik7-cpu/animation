@@ -30,20 +30,19 @@ const MODEL = (() => {
 const CONFIG = {
   // Персонаж Mixamo с мешем — то, что видно в превью. Если файла нет,
   // приложение берёт старый риг без меша и работает как раньше.
-  characterUrl: encodeURI('/Basic Shooter Pack/Ch18_nonPBR.fbx'),
+  characterUrl: encodeURI('/Ch44_nonPBR.fbx'),
   // Запасной риг: скелет + клип, если персонаж не загрузился
   rigUrl: encodeURI('/Fight Idle To Standing Idle.fbx'),
-  // Клипы из пака: играются на персонаже кнопкой «Проиграть клип».
-  // Скелет у них Mixamo, поэтому цепляются к персонажу по именам костей.
-  clips: [
-    { name: 'Стойка с винтовкой', url: '/Basic Shooter Pack/rifle aiming idle.fbx' },
-    { name: 'Ходьба', url: '/Basic Shooter Pack/walking.fbx' },
-    { name: 'Бег', url: '/Basic Shooter Pack/rifle run.fbx' },
-    { name: 'Перезарядка', url: '/Basic Shooter Pack/reloading.fbx' },
-    { name: 'Выстрел', url: '/Basic Shooter Pack/firing rifle.fbx' },
-  ],
+  // Клипы: отдельные FBX с тем же скелетом Mixamo. У нового персонажа своих
+  // анимаций нет, а шаблонный пак убран — список пуст, и выбор клипа просто
+  // выключается. Чтобы вернуть клипы, достаточно дописать сюда { name, url }.
+  clips: [],
   wasmPath: '/vendor/mediapipe/wasm',
   modelPath: `/vendor/models/pose_landmarker_${MODEL}.task`,
+  // Кисти: отдельная модель HandLandmarker в своём воркере. Проход по кадру
+  // стоит ~40 мс на две руки, поэтому её можно выключить: ?hands=off или галочкой.
+  handModelPath: '/vendor/models/hand_landmarker.task',
+  hands: new URLSearchParams(location.search).get('hands') !== 'off',
   // Ширина кадра, который уходит в модель. 640 хватает с запасом: сеть всё
   // равно работает на 256 px. ?infer=full — подавать как есть, ?infer=N — свою.
   inferWidth: (() => {
@@ -65,6 +64,10 @@ const state = {
   legGuard: true,
   gesture: true,
   sound: true,
+  hands: CONFIG.hands,
+  handsOk: false,
+  handsMs: 0,
+  handsCount: 0,
   telemetry: false,
   heightMeters: 1.75,
   loop: null,
@@ -181,6 +184,7 @@ async function loadRig() {
   for (const url of [CONFIG.characterUrl, CONFIG.rigUrl]) {
     if (!url) continue;
     try {
+      log(`Загружаю модель: ${decodeURI(url).split('/').pop()}…`);
       root = await new FBXLoader().loadAsync(url);
       state.modelUrl = decodeURI(url).split('/').pop();
       log(`Модель: ${state.modelUrl}`);
@@ -250,7 +254,9 @@ async function loadRig() {
 
   // Клипы: у персонажа из пака своих анимаций нет — они лежат отдельными
   // файлами, но с тем же скелетом Mixamo.
-  const own = root.animations || [];
+  // В файле персонажа Mixamo часто лежит только T-поза длиной 0.03 с — это не
+  // клип, играть нечего. Настоящие клипы — отдельные FBX в CONFIG.clips.
+  const own = (root.animations || []).filter((c) => c?.tracks?.length && c.duration > 0.1);
   mixer = new THREE.AnimationMixer(root);
   buildClipPick();
   const first = await setClip(0, { quiet: true });
@@ -283,6 +289,7 @@ function buildClipPick() {
   });
   sel.value = '0';
   sel.disabled = CONFIG.clips.length < 2;
+  sel.style.display = CONFIG.clips.length ? '' : 'none';
 }
 
 // Поставить клип на персонажа. play=false — показать первый кадр и ждать.
@@ -407,6 +414,49 @@ function unpackWorld(buf) {
   return out;
 }
 
+// Мировые точки кисти (метры, начало в центре кисти) → оси three.js. Кисть
+// приходит в тех же осях, что и тело, поэтому хватает того же перевода.
+function toWorldPoints(flat) {
+  const n = flat.length / 4;
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = landmarkToWorld(
+      { x: flat[i * 4], y: flat[i * 4 + 1], z: flat[i * 4 + 2] },
+      state.mirror,
+      new THREE.Vector3(),
+    );
+  }
+  return out;
+}
+
+// HandLandmarker находит до двух кистей, но не говорит, где левая. Привязываем
+// по близости запястья кисти к запястью тела в кадре — это не зависит от того,
+// зеркалит ли камера картинку (HandLandmarker считает, что зеркалит).
+function unpackHands(list, image) {
+  const out = { l: null, r: null };
+  if (!list?.length || !image || image.length < 33) return out;
+  const wrists = { l: image[15], r: image[16] };
+  const used = new Set();
+  for (const side of ['l', 'r']) {
+    const w = wrists[side];
+    if (!w) continue;
+    let best = -1;
+    let bestD = 0.25; // доля кадра: дальше запястье и кисть уже не совпадают
+    for (let i = 0; i < list.length; i++) {
+      if (used.has(i)) continue;
+      const img = list[i].image;
+      if (!img || img.length < 4) continue;
+      const d = Math.hypot(img[0] - w.x, img[1] - w.y);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    if (best >= 0) {
+      used.add(best);
+      out[side] = toWorldPoints(list[best].world);
+    }
+  }
+  return out;
+}
+
 // Ключевые точки, по которым решаем, что человек вообще виден
 const TRACK_JOINTS = [11, 12, 23, 24, 25, 26, 27, 28];
 
@@ -443,7 +493,13 @@ function onPose(msg) {
   // телеметрия — где ноги в кадре и не срезаны ли.
   const image = unpackWorld(msg.image);
   lastImagePts = image;
-  processWorld(raw, { image });
+  // Кисти считает отдельный воркер своим темпом. Берём последний результат,
+  // если он не старше 0.35 с: иначе пальцы лучше держать, чем дёргать.
+  const now = performance.now() / 1000;
+  const fresh = state.hands && lastHandRaw && now - lastHandsAt < 0.35;
+  const hands = fresh ? unpackHands(lastHandRaw, image) : null;
+  state.handsCount = hands ? (hands.l ? 1 : 0) + (hands.r ? 1 : 0) : 0;
+  processWorld(raw, { image, hands });
   drawOverlay(msg.image);
 }
 
@@ -523,8 +579,13 @@ function processWorld(raw, opts = {}) {
       guardPoints: guardPts,
       image: opts.image,
       legGuard: state.legGuard,
+      hands: opts.hands || null,
       t,
     });
+
+    // Без клипов (у персонажа только меш) поза «тела нет» — первая живая:
+    // T-поза посреди работы выглядит как поломка.
+    if (!retargeter.relaxPose) retargeter.captureRelaxPose();
 
     // Момент, когда предохранителю пришлось держать ногу, — самое интересное для
     // разбора. Помечаем его, чтобы кадр камеры и вид персонажа снялись сразу.
@@ -676,6 +737,13 @@ let poseReady = false;
 let useMainThread = false;
 let mainLandmarker = null;
 
+// ---------- воркер кистей ----------
+let handWorker = null;
+let handPending = false;
+let lastHandRaw = null;   // последний ответ HandLandmarker (21 точка × 2)
+let lastHandsAt = 0;      // когда он пришёл, секунды
+let lastHandVideoTime = -1;
+
 function packPoints(arr) {
   const out = [];
   for (const p of arr) out.push({ x: p.x, y: p.y, z: p.z, visibility: p.visibility ?? 1 });
@@ -707,6 +775,52 @@ function startPoseWorker() {
     wasmPath: CONFIG.wasmPath,
     modelPath: CONFIG.modelPath,
   });
+  // Кисти — отдельный воркер: его проход по кадру не должен задерживать тело.
+  if (state.hands) startHandWorker();
+}
+
+// Кисти: свой воркер. Загружаем один раз; галочка в HUD только перестаёт
+// посылать кадры (сам воркер остаётся в памяти).
+function startHandWorker() {
+  if (handWorker || !state.hands) return;
+  handWorker = new Worker('./src/hands.worker.js', { type: 'module' });
+  handWorker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'ready') {
+      state.handsOk = !!msg.hands;
+      state.handsDelegate = msg.delegate || '';
+      log(msg.hands
+        ? `Кисти и пальцы готовы (воркер, ${msg.delegate || '?'})`
+        : 'Кисти недоступны: модель не загрузилась');
+    } else if (msg.type === 'hands') {
+      handPending = false;
+      lastHandRaw = msg.hands;
+      lastHandsAt = performance.now() / 1000;
+      state.handsMs = msg.ms || 0;
+    } else if (msg.type === 'log') {
+      console.log('[кисти]', msg.text);
+    } else if (msg.type === 'error') {
+      handPending = false;
+      state.handsOk = false;
+      log('Ошибка кистей: ' + msg.text);
+    }
+  };
+  handWorker.postMessage({
+    type: 'init',
+    wasmPath: CONFIG.wasmPath,
+    handModelPath: CONFIG.handModelPath,
+    delegate: 'GPU',
+  });
+}
+
+// Кадр для кистей — только когда предыдущий уже посчитан: очередь из кадров
+// даёт задержку, а пальцам достаточно последнего.
+function pumpHands(src, ts) {
+  if (!state.hands || !state.handsOk || !handWorker || handPending) return;
+  handPending = true;
+  createImageBitmap(src).then((bitmap) => {
+    handWorker.postMessage({ type: 'frame', bitmap, ts }, [bitmap]);
+  }).catch(() => { handPending = false; });
 }
 
 // Если воркер не смог поднять MediaPipe — считаем позу в главном потоке.
@@ -773,36 +887,48 @@ function packFlat(arr) {
 // подавать 1280×720 незачем: текстура вдвое больше — и вдвое дороже. Замер на
 // неподвижном кадре: 1000 px → 122 мс, 640 px → 65 мс.
 let inferCanvas = null;
-function frameForPose(video) {
+function frameSource(video) {
   const w = video.videoWidth;
   const h = video.videoHeight;
   if (!w || !h) return null;
   const tw = CONFIG.inferWidth ? Math.min(CONFIG.inferWidth, w) : w;
-  if (tw >= w) return createImageBitmap(video);
+  if (tw >= w) return video;
   const th = Math.max(1, Math.round((h * tw) / w));
   if (!inferCanvas) inferCanvas = document.createElement('canvas');
   if (inferCanvas.width !== tw || inferCanvas.height !== th) {
     inferCanvas.width = tw;
     inferCanvas.height = th;
   }
-  const g = inferCanvas.getContext('2d');
-  g.drawImage(video, 0, 0, tw, th);
-  return createImageBitmap(inferCanvas);
+  inferCanvas.getContext('2d').drawImage(video, 0, 0, tw, th);
+  return inferCanvas;
 }
 
 function pumpVideo() {
   if (!videoEl || state.mode === 'clip' || state.synthetic) return;
-  if (useMainThread) { detectMainThread(); return; }
+  if (useMainThread) {
+    detectMainThread();
+    // Без воркера позы кадры идут с частотой rAF: кистям нужен новый кадр
+    // видео, а не тот же самый 60 раз в секунду.
+    if (videoEl.currentTime !== lastHandVideoTime) {
+      lastHandVideoTime = videoEl.currentTime;
+      const src = frameSource(videoEl);
+      if (src) pumpHands(src, performance.now());
+    }
+    return;
+  }
   if (!worker) return;
   if (videoEl.readyState < 2) return;
   if (videoEl.currentTime === lastVideoTime) return;
   if (pendingFrame) return;
   lastVideoTime = videoEl.currentTime;
   pendingFrame = true;
-  const job = frameForPose(videoEl);
-  if (!job) { pendingFrame = false; return; }
-  job.then((bitmap) => {
-    worker.postMessage({ type: 'frame', bitmap, ts: performance.now() }, [bitmap]);
+  const src = frameSource(videoEl);
+  if (!src) { pendingFrame = false; return; }
+  createImageBitmap(src).then((bitmap) => {
+    const ts = performance.now();
+    worker.postMessage({ type: 'frame', bitmap, ts }, [bitmap]);
+    // Кисти — по тому же кадру, своим ходом.
+    pumpHands(src, ts);
   }).catch(() => { pendingFrame = false; });
 }
 
@@ -975,6 +1101,29 @@ function updateHud() {
       poseEl.textContent = `${Math.round(state.poseFps)} к/с · ${state.poseModel}`
         + `${dev ? ` · ${dev}` : ''}${ms ? ` · ${ms} мс` : ''}`;
       poseEl.className = ms > 45 ? 'hot' : 'ok';
+    }
+  }
+
+  // Кисти: сколько рук видит HandLandmarker и сколько стоит второй проход
+  const handsEl = $('handsInfo');
+  if (handsEl) {
+    if (!state.hands) {
+      handsEl.textContent = 'выкл';
+      handsEl.className = '';
+    } else if (!state.poseReady) {
+      handsEl.textContent = '—';
+      handsEl.className = '';
+    } else if (!state.handsOk) {
+      handsEl.textContent = 'загружаю…';
+      handsEl.className = '';
+    } else if (state.mode === 'clip') {
+      handsEl.textContent = '—';
+      handsEl.className = '';
+    } else {
+      const ms = Math.round(state.handsMs);
+      const n = state.handsCount;
+      handsEl.textContent = `${n === 2 ? 'обе' : n === 1 ? 'одна' : 'нет'}${ms ? ` · ${ms} мс` : ''}`;
+      handsEl.className = n ? 'ok' : '';
     }
   }
 
@@ -1699,9 +1848,9 @@ function pumpObserver() {
   // и её воркер не должен занимать GPU.
   if (state.mode === 'clip' || obs.pending || !obs.worker) return;
   obs.pending = true;
-  const job = frameForPose(v);
-  if (!job) { obs.pending = false; return; }
-  job.then((bitmap) => {
+  const src = frameSource(v);
+  if (!src) { obs.pending = false; return; }
+  createImageBitmap(src).then((bitmap) => {
     obs.worker?.postMessage({ type: 'frame', bitmap, ts: performance.now() }, [bitmap]);
   }).catch(() => { obs.pending = false; });
 }
@@ -2323,6 +2472,19 @@ function wireUi() {
     state.footLock = e.target.checked;
     if (retargeter) retargeter.footLock = state.footLock;
   });
+  if ($('chkHands')) $('chkHands').checked = state.hands;
+  $('chkHands')?.addEventListener('change', (e) => {
+    state.hands = e.target.checked;
+    if (state.hands) startHandWorker();
+    if (!state.hands) {
+      lastHandRaw = null;
+      handPending = false;
+      state.handsCount = 0;
+    }
+    log(state.hands
+      ? 'Кисти включены: пальцы идут с камеры'
+      : 'Кисти выключены: пальцы держат последнюю позу');
+  });
   $('chkLegGuard').addEventListener('change', (e) => {
     state.legGuard = e.target.checked;
     if (retargeter) retargeter.guardEnabled = state.legGuard;
@@ -2479,7 +2641,8 @@ async function resolveModelPath() {
     // Прогнать произвольный набор точек через тот же путь, что и камеру
     // (второй аргумент — точки кадра: по ним предохранитель ног видит, что
     //  точка вышла за кадр, и насколько крупно нога видна)
-    feed: (points, image) => processWorld(points, { image }),
+    feed: (points, image, hands) => processWorld(points, { image, hands }),
+    unpackHands,
     gestureFromPose: (points) => gesture.update(points, performance.now() / 1000),
     checkBVH,
     telemetryToggle,
