@@ -51,10 +51,12 @@ async function createLandmarker({ wasmPath, modelPath, delegate }) {
   });
 
   try {
-    return await PoseLandmarker.createFromOptions(vision, opts(delegate || 'GPU'));
+    const lm = await PoseLandmarker.createFromOptions(vision, opts(delegate || 'GPU'));
+    return { landmarker: lm, delegate: delegate || 'GPU' };
   } catch (err) {
     self.postMessage({ type: 'log', text: `GPU не взлетел (${err?.message || err}), падаю на CPU` });
-    return await PoseLandmarker.createFromOptions(vision, opts('CPU'));
+    const lm = await PoseLandmarker.createFromOptions(vision, opts('CPU'));
+    return { landmarker: lm, delegate: 'CPU' };
   }
 }
 
@@ -80,8 +82,9 @@ self.onmessage = async (e) => {
 
   if (msg.type === 'init') {
     try {
-      landmarker = await createLandmarker(msg);
-      self.postMessage({ type: 'ready' });
+      const made = await createLandmarker(msg);
+      landmarker = made.landmarker;
+      self.postMessage({ type: 'ready', delegate: made.delegate });
     } catch (err) {
       self.postMessage({ type: 'error', text: String(err?.message || err) });
     }

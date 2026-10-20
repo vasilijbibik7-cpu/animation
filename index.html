@@ -97,9 +97,12 @@
   <div class="row"><span class="k">Состояние</span><span id="track" class="bad">ожидание</span></div>
   <div class="row"><span class="k">Камера</span><span id="camState">выключена</span></div>
   <div class="row"><span class="k">FPS</span><span id="fps">0</span></div>
+  <div class="row"><span class="k">Поза</span><span id="poseInfo">—</span></div>
   <div class="row"><span class="k">Костей Mixamo</span><span id="bones">0</span></div>
-  <div class="row"><span class="k">Клип в файле</span><span id="clipName">—</span></div>
+  <div class="row"><span class="k">Клип</span><span id="clipName">—</span></div>
+  <select id="clipPick" title="Клип из пака"></select>
   <div class="row"><span class="k">Ноги</span><span id="legsInfo">—</span></div>
+  <div class="row"><span class="k">Стопа опоры</span><span id="slipInfo">—</span></div>
   <div class="frame">
     <canvas id="frameBox" width="192" height="108"></canvas>
     <div class="txt">
@@ -157,6 +160,8 @@
   <button id="btnBvhCheck" disabled>Проверить BVH</button>
   <label class="chk"><input type="checkbox" id="chkLoopFade" checked> Сшивать цикл (0.3 с)</label>
   <label class="chk"><input type="checkbox" id="chkGesture" checked> Запись жестом (руки вверх)</label>
+  <label class="chk"><input type="checkbox" id="chkSound" checked> Звуковые метки (отсчёт, старт, стоп)</label>
+  <div class="hint">Пробел — запись, P — клип, R — просмотр записи, T — телеметрия</div>
   <div class="hint">BVH: Blender → File → Import → Motion Capture (.bvh)</div>
 
   <hr>
@@ -168,6 +173,7 @@
   <label class="chk"><input type="checkbox" id="chkRootMotion" checked> Корневое движение</label>
   <label class="chk"><input type="checkbox" id="chkFollowCam" checked> Камера следит за персонажем</label>
   <label class="chk"><input type="checkbox" id="chkDebug" checked> Показывать камеру и точки</label>
+  <label class="chk"><input type="checkbox" id="chkSkeleton"> Показывать скелет (точки)</label>
 
   <div class="slider">
     <div class="row"><span class="k">Рост, м</span><span id="heightVal">1.75</span></div>

@@ -13,6 +13,11 @@
 import * as THREE from 'three';
 import { LegGuard } from './legs.js';
 
+// Как распределить общий наклон корпуса по трём суставам спины: доля поворота,
+// накопленная к этому суставу. 0.5 / 0.8 / 1.0 — спина гнётся дугой, а не
+// щёлкает одним суставом.
+const SPINE_SPLIT = [['spine', 0.5], ['spine1', 0.8], ['spine2', 1.0]];
+
 // Индексы точек MediaPipe Pose (33 шт.)
 export const MP = {
   nose: 0,
@@ -102,6 +107,11 @@ export class Retargeter {
     this.legGuard = new LegGuard(opts.legGuardOpts || {});
     this.heldLegs = { l: null, r: null };
     this.poleSmooth = { l: null, r: null };
+
+    // Скольжение опорной стопы: пока стопа стоит, её мировая точка не должна
+    // ехать. Скорость в единицах модели в секунду (см/с для Mixamo-модели).
+    this.slipRate = { l: 0, r: 0 };
+    this._footPrev = { l: null, r: null };
   }
 
   // Вызывать после добавления модели в сцену.
@@ -123,8 +133,41 @@ export class Retargeter {
     });
   }
 
-  resetRoot() {
-    this.rootMotion.reset();
+  // Поза «человека нет в кадре». Берём первый кадр клипа, а не rest-позу:
+  // T-поза посреди работы выглядит как поломка.
+  captureRelaxPose() {
+    const map = new Map();
+    for (const key of Object.keys(this.rig)) {
+      const bone = this.rig[key];
+      if (bone) map.set(bone, bone.quaternion.clone());
+    }
+    this.relaxPose = map;
+  }
+
+  // Тело пропало из кадра: плавно уводим управляемые кости в rest-позу,
+  // а не держим кадр замороженным. Возвращает true, пока ещё есть куда идти.
+  relax(dt = 0.016) {
+    if (!this.modelRoot) return false;
+    const k = 1 - Math.exp(-dt / 0.35);
+    let moving = false;
+    for (const key of Object.keys(this.rig)) {
+      const bone = this.rig[key];
+      if (!bone) continue;
+      const target = (this.relaxPose && this.relaxPose.get(bone)) || this.restLocal.get(bone);
+      if (!target) continue;
+      bone.quaternion.slerp(target, k);
+      if (bone.quaternion.angleTo(target) > 0.004) moving = true;
+    }
+    const dy = this.baseRootY - this.modelRoot.position.y;
+    if (Math.abs(dy) > 1e-4) {
+      this.modelRoot.position.y += dy * k;
+      moving = true;
+    }
+    this.modelRoot.updateMatrixWorld(true);
+    return moving;
+  }
+
+  resetRoot() {    this.rootMotion.reset();
     this.rootReady = false;
     this.legGuard.reset();
     this.heldLegs = { l: null, r: null };
@@ -227,6 +270,20 @@ export class Retargeter {
       lFoot: dir(MP.lAnkle, MP.lFoot).normalize(),
       rFoot: dir(MP.rAnkle, MP.rFoot).normalize(),
     };
+
+    // Спина: общий наклон раскладываем на три сустава. Иначе весь наклон
+    // приходится на Spine, а Spine1/Spine2 стоят доской и торс не гнётся.
+    const spineRest = this.restWorldDir.get('spine');
+    if (spineRest) {
+      const qTotal = new THREE.Quaternion().setFromUnitVectors(spineRest, targets.spine);
+      const qPart = new THREE.Quaternion();
+      for (const [key, f] of SPINE_SPLIT) {
+        const base = this.restWorldDir.get(key);
+        if (!base) continue;
+        qPart.identity().slerp(qTotal, f);
+        targets[key] = base.clone().applyQuaternion(qPart).normalize();
+      }
+    }
 
     // ---- базис таза: x — ось бёдер, y — вверх по корпусу ----
     const xAxis = new THREE.Vector3(
@@ -450,6 +507,18 @@ export class Retargeter {
       };
 
       result[side] = { target, knee: kneeTarget, worldQ: footQ, planted, reach: dRaw / full, held: false };
+
+      // Скольжение опоры: сравнение мировой точки стопы с прошлым кадром.
+      // Считаем только когда стопа стояла и стоит (шаг и перенос — не скольжение).
+      const prev = this._footPrev[side];
+      if (prev && prev.planted && planted) {
+        const dt = Math.max(1e-3, t - prev.t);
+        const v = Math.hypot(target.x - prev.x, target.z - prev.z) / dt;
+        this.slipRate[side] = this.slipRate[side] * 0.9 + v * 0.1;
+      } else {
+        this.slipRate[side] *= 0.9;
+      }
+      this._footPrev[side] = { x: target.x, z: target.z, t, planted };
     }
     return result;
   }
@@ -514,7 +583,9 @@ export class RootMotionTracker {
     this.prevPlanted = [false, false];
     this.plantEps = opts.plantEps ?? 2.5; // в единицах модели (≈3 % длины ноги)
     this.maxStep = opts.maxStep ?? 0.06; // максимум метров за кадр (скорость 3.6 м/с)
-    this.gain = opts.gain ?? 0.95; // 1 — жёстко держать опорную стопу
+    // 1 — опорная стопа держится жёстко: смещение таза ровно равно смещению
+    // стопы. Раньше стояло 0.95 «на всякий случай», и опора ехала на 5 % шага.
+    this.gain = opts.gain ?? 1;
   }
 
   reset() {

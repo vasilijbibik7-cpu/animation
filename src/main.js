@@ -19,11 +19,38 @@ import { TrimStrip } from './trim.js';
 import { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor } from './polish.js';
 import { LegGuard, LEG_POINTS } from './legs.js';
 
+// Модель позы: ?model=lite быстрее и грубее, full — по умолчанию.
+// heavy тоже поддерживается, если файл положить в vendor/models.
+const MODEL = (() => {
+  const m = new URLSearchParams(location.search).get('model');
+  return ['lite', 'full', 'heavy'].includes(m) ? m : 'full';
+})();
+
 const CONFIG = {
-  // Скелет + клип Mixamo (можно положить любой FBX/GLB с ригом Mixamo)
+  // Персонаж Mixamo с мешем — то, что видно в превью. Если файла нет,
+  // приложение берёт старый риг без меша и работает как раньше.
+  characterUrl: encodeURI('/Basic Shooter Pack/Ch18_nonPBR.fbx'),
+  // Запасной риг: скелет + клип, если персонаж не загрузился
   rigUrl: encodeURI('/Fight Idle To Standing Idle.fbx'),
+  // Клипы из пака: играются на персонаже кнопкой «Проиграть клип».
+  // Скелет у них Mixamo, поэтому цепляются к персонажу по именам костей.
+  clips: [
+    { name: 'Стойка с винтовкой', url: '/Basic Shooter Pack/rifle aiming idle.fbx' },
+    { name: 'Ходьба', url: '/Basic Shooter Pack/walking.fbx' },
+    { name: 'Бег', url: '/Basic Shooter Pack/rifle run.fbx' },
+    { name: 'Перезарядка', url: '/Basic Shooter Pack/reloading.fbx' },
+    { name: 'Выстрел', url: '/Basic Shooter Pack/firing rifle.fbx' },
+  ],
   wasmPath: '/vendor/mediapipe/wasm',
-  modelPath: '/vendor/models/pose_landmarker_full.task',
+  modelPath: `/vendor/models/pose_landmarker_${MODEL}.task`,
+  // Ширина кадра, который уходит в модель. 640 хватает с запасом: сеть всё
+  // равно работает на 256 px. ?infer=full — подавать как есть, ?infer=N — свою.
+  inferWidth: (() => {
+    const v = new URLSearchParams(location.search).get('infer');
+    if (v === 'full') return 0;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 256 ? n : 640;
+  })(),
 };
 
 // ---------- состояние ----------
@@ -36,6 +63,7 @@ const state = {
   footLock: true,
   legGuard: true,
   gesture: true,
+  sound: true,
   telemetry: false,
   heightMeters: 1.75,
   loop: null,
@@ -43,9 +71,16 @@ const state = {
   mode: 'live', // live | clip
   synthetic: false,
   tracking: false,
+  hasMesh: false,
+  skeletonView: true,
+  poseMs: 0,
+  poseDelegate: '',
+  poseModel: MODEL,
+  poseFps: 0,
   camState: 'off', // off | ok | fail
   perm: 'unknown',
   lastPoseAt: 0,
+  lastGoodPoseAt: 0,
   fps: 0,
   frames: 0,
   fpsTime: 0,
@@ -57,6 +92,31 @@ const statusEl = $('status');
 function log(text) {
   console.log('[mocap]', text);
   if (statusEl) statusEl.textContent = text;
+}
+
+// ---------- звук ----------
+// Работа идёт в 2–3 метрах от ноутбука: на HUD в этот момент не смотрят,
+// поэтому старт/стоп записи и отсчёт слышно.
+let audioCtx = null;
+function beep(freq = 880, ms = 120, volume = 0.06) {
+  if (!state.sound) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.linearRampToValueAtTime(volume, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + ms / 1000 + 0.02);
+  } catch { /* звук не критичен */ }
 }
 
 // ---------- сцена ----------
@@ -76,6 +136,10 @@ scene.add(new THREE.HemisphereLight(0x9fc3ff, 0x1a1a22, 1.5));
 const key = new THREE.DirectionalLight(0xffffff, 1.6);
 key.position.set(2, 4, 3);
 scene.add(key);
+// Заполняющий свет: персонаж из пака почти чёрный, без него силуэт теряется.
+const fill = new THREE.DirectionalLight(0x9fc3ff, 1.1);
+fill.position.set(-3, 2.5, -4);
+scene.add(fill);
 
 let grid = null;
 let modelRoot = null;
@@ -111,15 +175,20 @@ function collectBones() {
 // ---------- загрузка рига ----------
 async function loadRig() {
   let root = null;
-  let animations = [];
 
-  try {
-    const fbx = await new FBXLoader().loadAsync(CONFIG.rigUrl);
-    root = fbx;
-    animations = fbx.animations || [];
-    log(`FBX загружен: ${animations.length} клип(ов)`);
-  } catch (err) {
-    console.warn(err);
+  // Порядок: персонаж с мешем → старый риг без меша → запасной скелет.
+  for (const url of [CONFIG.characterUrl, CONFIG.rigUrl]) {
+    if (!url) continue;
+    try {
+      root = await new FBXLoader().loadAsync(url);
+      state.modelUrl = decodeURI(url).split('/').pop();
+      log(`Модель: ${state.modelUrl}`);
+      break;
+    } catch (err) {
+      console.warn(err);
+    }
+  }
+  if (!root) {
     root = buildFallbackRig();
     log('FBX не загрузился, работаю на запасном скелете');
   }
@@ -137,6 +206,13 @@ async function loadRig() {
     log('В файле нет костей Mixamo — запасной скелет');
   }
   rig = found.rig;
+
+  let meshes = 0;
+  root.traverse((o) => { if (o.isMesh) meshes++; });
+  state.hasMesh = meshes > 0;
+  // С мешем точки скелета только мешают: по умолчанию выключены.
+  state.skeletonView = !state.hasMesh;
+  if ($('chkSkeleton')) $('chkSkeleton').checked = state.skeletonView;
 
   fitScene(root);
 
@@ -169,21 +245,70 @@ async function loadRig() {
   scene.add(skeletonHelper);
   buildJointDots(root);
 
-  // Клип из файла
-  if (animations.length) {
-    clip = animations[0];
-    mixer = new THREE.AnimationMixer(root);
-    clipAction = mixer.clipAction(clip);
-    clipAction.loop = THREE.LoopRepeat;
-    clipAction.play();
-    clipAction.paused = true;
-    $('clipName').textContent = clip.name || '(без имени)';
-  } else {
+  // Клипы: у персонажа из пака своих анимаций нет — они лежат отдельными
+  // файлами, но с тем же скелетом Mixamo.
+  const own = root.animations || [];
+  if (own.length && !CONFIG.clips.length) {
+    CONFIG.clips.push({ name: own[0].name || 'клип из файла', clip: own[0] });
+  }
+  mixer = new THREE.AnimationMixer(root);
+  buildClipPick();
+  const first = await setClip(0, { quiet: true });
+  if (!first) {
     $('clipName').textContent = 'нет';
-    $('btnPlay').disabled = true;
+    if ($('btnPlay')) $('btnPlay').disabled = true;
   }
 
   return root;
+}
+
+// ---------- клипы из пака ----------
+function buildClipPick() {
+  const sel = $('clipPick');
+  if (!sel) return;
+  sel.textContent = '';
+  CONFIG.clips.forEach((c, i) => {
+    const o = document.createElement('option');
+    o.value = String(i);
+    o.textContent = c.name;
+    if (!c.url) o.title = 'клип внутри модели';
+    sel.appendChild(o);
+  });
+  sel.value = '0';
+  sel.disabled = CONFIG.clips.length < 2;
+}
+
+// Поставить клип на персонажа. play=false — показать первый кадр и ждать.
+async function setClip(index, { play = false, quiet = false } = {}) {
+  const entry = CONFIG.clips[index];
+  if (!entry || !mixer) return null;
+
+  if (!entry.clip && entry.url) {
+    try {
+      const fbx = await new FBXLoader().loadAsync(encodeURI(entry.url));
+      entry.clip = fbx.animations && fbx.animations[0];
+      if (!entry.clip) throw new Error('в файле нет анимации');
+    } catch (err) {
+      console.warn(err);
+      log(`Клип «${entry.name}» не загрузился: ${err?.message || err}`);
+      return null;
+    }
+  }
+  if (!entry.clip) return null;
+
+  if (clipAction) clipAction.stop();
+  clip = entry.clip;
+  clipAction = mixer.clipAction(clip);
+  clipAction.loop = THREE.LoopRepeat;
+  clipAction.reset().play();
+  clipAction.paused = !play;
+  mixer.update(0); // сразу встать в первый кадр клипа, а не в T-позу
+  retargeter?.captureRelaxPose();
+
+  if ($('clipName')) $('clipName').textContent = entry.name;
+  if ($('clipPick')) $('clipPick').value = String(index);
+  if (!quiet) log(play ? `Клип: ${entry.name}` : `Клип выбран: ${entry.name}`);
+  return clip;
 }
 
 function boneBounds(root) {
@@ -208,6 +333,16 @@ function fitScene(root) {
 
   // ставим самую низкую кость ровно на пол
   baseRootY = -box.min.y;
+
+  // Меш бывает ниже костей (подошвы, каблуки) — тогда на пол ставим по нему,
+  // иначе персонаж висит в воздухе на пару сантиметров.
+  if (state.hasMesh) {
+    const meshBox = new THREE.Box3().setFromObject(root);
+    if (isFinite(meshBox.min.y) && Math.abs(meshBox.min.y) < modelHeight) {
+      baseRootY = -meshBox.min.y;
+    }
+  }
+
   root.position.y = baseRootY;
   root.updateMatrixWorld(true);
 
@@ -242,7 +377,11 @@ function buildJointDots(root) {
 
 function updateJointDots() {
   const v = new THREE.Vector3();
+  const show = state.skeletonView;
+  if (skeletonHelper) skeletonHelper.visible = show;
   for (const dot of jointDots) {
+    dot.mesh.visible = show;
+    if (!show) continue;
     v.setFromMatrixPosition(dot.bone.matrixWorld);
     dot.mesh.position.copy(v);
   }
@@ -288,6 +427,8 @@ function legLengths(pts) {
 function onPose(msg) {
   state.diagCount = msg.count;
   state.diagMs = msg.ms;
+  state.poseMs = msg.ms || 0;
+  poseRate.tick();
   const raw = unpackWorld(msg.world);
   if (raw.length < 33) { state.tracking = false; return; }
   // Точки кадра нужны предохранителю ног: по ним видно, что точка «дорисована»
@@ -298,6 +439,19 @@ function onPose(msg) {
   processWorld(raw, { image });
   drawOverlay(msg.image);
 }
+
+// Частота позы за последние 2 с: воркер отдаёт кадры неровно, среднее за всю
+// сессию врёт, а окно показывает то, что есть сейчас.
+const poseRate = {
+  times: [],
+  tick() {
+    const now = performance.now();
+    this.times.push(now);
+    while (this.times.length && now - this.times[0] > 2000) this.times.shift();
+    const span = (now - this.times[0]) / 1000;
+    state.poseFps = this.times.length > 1 && span > 0 ? (this.times.length - 1) / span : 0;
+  },
+};
 
 // Единый путь обработки: подходит и для камеры, и для тестового скелета
 function processWorld(raw, opts = {}) {
@@ -316,6 +470,7 @@ function processWorld(raw, opts = {}) {
     return; // держим последнюю позу, не дёргаемся
   }
   state.tracking = true;
+  state.lastGoodPoseAt = performance.now();
 
   const filtered = lmFilter.apply(raw, t);
 
@@ -526,7 +681,8 @@ function startPoseWorker() {
     if (msg.type === 'ready') {
       poseReady = true;
       state.poseReady = true;
-      log('Модель позы готова (воркер)');
+      state.poseDelegate = msg.delegate || '';
+      log(`Модель позы готова (воркер, ${state.poseDelegate || '?'}, ${state.poseModel})`);
     } else if (msg.type === 'pose') {
       pendingFrame = false;
       onPose(msg);
@@ -560,10 +716,13 @@ async function fallbackToMainThread(reason) {
     });
     try {
       mainLandmarker = await PoseLandmarker.createFromOptions(vision, opts('GPU'));
+      state.poseDelegate = 'GPU';
     } catch {
       mainLandmarker = await PoseLandmarker.createFromOptions(vision, opts('CPU'));
+      state.poseDelegate = 'CPU';
     }
     poseReady = true;
+    state.poseReady = true;
     worker.terminate();
     worker = null;
     log('Модель позы готова (главный поток)');
@@ -602,6 +761,27 @@ function packFlat(arr) {
   return out;
 }
 
+// Кадр для модели. MediaPipe всё равно ресайзит вход под свою сеть, поэтому
+// подавать 1280×720 незачем: текстура вдвое больше — и вдвое дороже. Замер на
+// неподвижном кадре: 1000 px → 122 мс, 640 px → 65 мс.
+let inferCanvas = null;
+function frameForPose(video) {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return null;
+  const tw = CONFIG.inferWidth ? Math.min(CONFIG.inferWidth, w) : w;
+  if (tw >= w) return createImageBitmap(video);
+  const th = Math.max(1, Math.round((h * tw) / w));
+  if (!inferCanvas) inferCanvas = document.createElement('canvas');
+  if (inferCanvas.width !== tw || inferCanvas.height !== th) {
+    inferCanvas.width = tw;
+    inferCanvas.height = th;
+  }
+  const g = inferCanvas.getContext('2d');
+  g.drawImage(video, 0, 0, tw, th);
+  return createImageBitmap(inferCanvas);
+}
+
 function pumpVideo() {
   if (!videoEl || state.mode === 'clip' || state.synthetic) return;
   if (useMainThread) { detectMainThread(); return; }
@@ -611,7 +791,9 @@ function pumpVideo() {
   if (pendingFrame) return;
   lastVideoTime = videoEl.currentTime;
   pendingFrame = true;
-  createImageBitmap(videoEl).then((bitmap) => {
+  const job = frameForPose(videoEl);
+  if (!job) { pendingFrame = false; return; }
+  job.then((bitmap) => {
     worker.postMessage({ type: 'frame', bitmap, ts: performance.now() }, [bitmap]);
   }).catch(() => { pendingFrame = false; });
 }
@@ -645,6 +827,12 @@ function loop() {
     recorder.apply(dt);
   }
   if (mixer && state.mode === 'clip' && !playRec) mixer.update(dt);
+
+  // Тело пропало: не держим кадр замороженным, а спокойно уходим в стойку.
+  if (state.mode === 'live' && !state.synthetic && !playRec && !state.tracking
+      && performance.now() - (state.lastGoodPoseAt || 0) > 350) {
+    retargeter?.relax(dt);
+  }
 
   updateJointDots();
   followCamera();
@@ -680,9 +868,23 @@ function followCamera() {
 }
 
 let lastRecText = '';
+// Звук по смене состояний записи: отсчёт, старт, стоп.
+let lastBeepCount = 0;
+let lastRecording = false;
+function audioTick() {
+  if (!recorder) return;
+  const cd = recorder.countdown > 0 ? Math.ceil(recorder.countdown) : 0;
+  if (cd && cd !== lastBeepCount) beep(720, 80);
+  lastBeepCount = cd;
+  if (recorder.recording && !lastRecording) beep(1180, 150);
+  else if (!recorder.recording && lastRecording) beep(470, 180, 0.07);
+  lastRecording = recorder.recording;
+}
+
 function updateRecState() {
   const el = $('recState');
   if (!el) return;
+  audioTick();
   let txt = '—';
   if (recorder) {
     if (recorder.recording) txt = `● ${recorder.elapsed.toFixed(1)} с · ${recorder.samples.length} проб`;
@@ -748,12 +950,28 @@ function updateHud() {
   }
   $('bones').textContent = `${Object.keys(rig || {}).length}`;
 
+  // Скорость позы: главный ограничитель всего остального. Видно сразу,
+  // на GPU модель или на CPU и сколько миллисекунд уходит на кадр.
+  const poseEl = $('poseInfo');
+  if (poseEl) {
+    if (!state.poseReady) {
+      poseEl.textContent = 'загрузка…';
+      poseEl.className = '';
+    } else {
+      const dev = state.poseDelegate === 'CPU' ? 'CPU' : state.poseDelegate ? 'GPU' : '';
+      const ms = Math.round(state.poseMs);
+      poseEl.textContent = `${Math.round(state.poseFps)} к/с · ${state.poseModel}`
+        + `${dev ? ` · ${dev}` : ''}${ms ? ` · ${ms} мс` : ''}`;
+      poseEl.className = ms > 45 ? 'hot' : 'ok';
+    }
+  }
+
   // Предохранитель ног: сколько доверия и почему нога «держится»
   const legsEl = $('legsInfo');
   const hintEl = $('legsHint');
   if (legsEl) {
     const g = retargeter && retargeter.legGuard;
-    if (!g) {
+    if (!g || state.mode === 'clip') {
       legsEl.textContent = '—';
       legsEl.className = '';
     } else if (!retargeter.guardEnabled) {
@@ -768,10 +986,29 @@ function updateHud() {
     }
     if (hintEl) {
       const h = g && retargeter.guardEnabled ? g.hint() : '';
-      hintEl.textContent = h || (legsEl.className === 'bad'
-        ? 'Ноги «держим»: модель не уверена в точках и держит последнюю позу'
-        : 'Ноги в порядке: колени и стопы идут с камеры');
-      hintEl.className = h ? 'hint hot' : 'hint';
+      hintEl.textContent = state.mode === 'clip'
+        ? 'Играется клип из файла — живой захват на паузе'
+        : (h || (legsEl.className === 'bad'
+          ? 'Ноги «держим»: модель не уверена в точках и держит последнюю позу'
+          : 'Ноги в порядке: колени и стопы идут с камеры'));
+      hintEl.className = h && state.mode !== 'clip' ? 'hint hot' : 'hint';
+    }
+  }
+
+  // Скольжение опорной стопы: пока стопа стоит, она не должна ехать по полу.
+  // Живая метрика — видно числом, а не на глаз.
+  const slipEl = $('slipInfo');
+  if (slipEl) {
+    const rt = retargeter;
+    if (!rt || state.mode !== 'live' || !state.tracking) {
+      slipEl.textContent = '—';
+      slipEl.className = '';
+    } else {
+      const l = rt.slipRate.l;
+      const r = rt.slipRate.r;
+      const worst = Math.max(l, r);
+      slipEl.textContent = `${l.toFixed(1)} / ${r.toFixed(1)} см/с`;
+      slipEl.className = worst > 8 ? 'bad' : worst > 3 ? 'hot' : 'ok';
     }
   }
 
@@ -1092,6 +1329,11 @@ function telemetryPayload(now) {
     scaleK: r3((retargeter && retargeter.scaleK) || 0), zGain: state.zGain, mirror: state.mirror,
     root: p ? [r3(p.x), r3(p.y), r3(p.z)] : null,
     guard: g ? g.snapshot() : null,
+    // Скольжение опорной стопы в см/с (в единицах модели): живая проверка,
+    // держится ли стопа на полу. Больше ~3 см/с — уже видно глазом.
+    slip: retargeter
+      ? { l: r3(retargeter.slipRate.l), r: r3(retargeter.slipRate.r) }
+      : null,
     legs: { hip: wp('hips'), kneeL: wp('lLeg'), footL: wp('lFoot'), kneeR: wp('rLeg'), footR: wp('rFoot') },
     // Точки ног как их вернула модель, в координатах кадра:
     // [x, y, видимость] по порядку [таз, колено, лодыжка, носок].
@@ -1442,7 +1684,9 @@ function pumpObserver() {
   // Превью рисуем сразу по видео, не дожидаясь позы: если модель никого не
   // найдёт, в окошке всё равно должно быть видно, что снимает камера.
   paintPreview($('overlayB'), v, null);
-  createImageBitmap(v).then((bitmap) => {
+  const job = frameForPose(v);
+  if (!job) { obs.pending = false; return; }
+  job.then((bitmap) => {
     obs.worker?.postMessage({ type: 'frame', bitmap, ts: performance.now() }, [bitmap]);
   }).catch(() => { obs.pending = false; });
 }
@@ -1559,7 +1803,7 @@ function jsonMeta() {
   return {
     mirror: state.mirror,
     zGain: state.zGain,
-    model: decodeURI(CONFIG.rigUrl),
+    model: state.modelUrl || 'fallback',
     quality: {
       contacts: q.contacts,
       contactSeconds: q.contactSeconds,
@@ -1932,6 +2176,11 @@ function wireUi() {
     updateRecUi();
   });
 
+  $('clipPick').addEventListener('change', async (e) => {
+    const i = Number(e.target.value) || 0;
+    await setClip(i, { play: state.mode === 'clip' });
+  });
+
   $('btnCal').addEventListener('click', () => {
     standingTracker.reset();
     lmFilter.reset();
@@ -1955,6 +2204,9 @@ function wireUi() {
     if (!state.legGuard) retargeter?.legGuard.reset();
   });
   $('chkFollowCam').addEventListener('change', (e) => { state.followCam = e.target.checked; });
+  $('chkSkeleton')?.addEventListener('change', (e) => {
+    state.skeletonView = e.target.checked;
+  });
   $('btnTele').addEventListener('click', () => telemetryToggle(!state.telemetry));
   $('zGain').addEventListener('input', (e) => { state.zGain = Number(e.target.value); });
   $('height').addEventListener('input', (e) => {
@@ -2015,6 +2267,26 @@ function wireUi() {
     gesture.reset();
     log(state.gesture ? 'Жест включён: руки вверх — старт/стоп' : 'Жест выключен');
   });
+  $('chkSound')?.addEventListener('change', (e) => {
+    state.sound = e.target.checked;
+    if (state.sound) beep(880, 100);
+  });
+
+  // Горячие клавиши: основной сценарий — стоять в 3 метрах от ноутбука.
+  window.addEventListener('keydown', (e) => {
+    const tag = (e.target && e.target.tagName) || '';
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(tag)) return;
+    if (e.code === 'Space') {
+      e.preventDefault();
+      $('btnRec').click();
+    } else if (e.code === 'KeyP') {
+      $('btnPlay').click();
+    } else if (e.code === 'KeyR') {
+      $('btnPlayRec').click();
+    } else if (e.code === 'KeyT') {
+      $('btnTele').click();
+    }
+  });
   $('btnTrimReset').addEventListener('click', () => {
     recorder?.resetTrim();
     log('Подрезка сброшена');
@@ -2053,6 +2325,10 @@ function wireUi() {
     get gesture() { return gesture; },
     get trimStrip() { return trimStrip; },
     get model() { return modelRoot; },
+    get mixer() { return mixer; },
+    get clipAction() { return clipAction; },
+    setClip,
+    CONFIG,
     syntheticPose,
     // Прогнать произвольный набор точек через тот же путь, что и камеру
     // (второй аргумент — точки кадра: по ним предохранитель ног видит, что
