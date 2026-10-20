@@ -50,12 +50,13 @@ export async function permissionState() {
 }
 
 // Пробуем по очереди: выбранная камера → с параметрами → вообще без требований.
-export async function startCamera({ deviceId, width = 1280, height = 720 } = {}) {
+// videoEl — чтобы можно было поднять вторую камеру в отдельный <video>.
+export async function startCamera({ deviceId, width = 1280, height = 720, videoEl } = {}) {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error('браузер не даёт доступ к камере (нет getUserMedia)');
   }
 
-  const video = document.getElementById('video');
+  const video = videoEl || document.getElementById('video');
   const attempts = [];
   if (deviceId) attempts.push({ video: { deviceId: { exact: deviceId } }, audio: false });
   attempts.push({

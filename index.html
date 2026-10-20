@@ -50,6 +50,18 @@
   #cam.rec { border-color: #ff5c5c; box-shadow: 0 0 0 2px rgba(255, 92, 92, .35); }
   #cam canvas { width: 100%; height: 100%; }
   #video { display: none; }
+  #camB {
+    position: fixed; right: 12px; bottom: 264px; width: 240px; height: 180px;
+    border: 1px solid #33415c; border-radius: 10px; overflow: hidden; background: #000;
+    display: none;
+  }
+  #camB.on { display: block; }
+  #camB canvas { width: 100%; height: 100%; }
+  #camB .tag {
+    position: absolute; left: 7px; top: 5px; font-size: 11px; color: #9fb3d1;
+    text-shadow: 0 0 6px #000; pointer-events: none;
+  }
+  #video2 { display: none; }
   #count {
     position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
     font-size: 22vh; font-weight: 700; color: #fff; text-shadow: 0 0 30px rgba(0,0,0,.8);
@@ -100,6 +112,17 @@
   <hr>
   <select id="camPick" title="Камера"></select>
   <button id="btnCam">Включить камеру</button>
+  <div class="row"><span class="k">Камера 2 (наблюдатель)</span><span id="camBState">выкл</span></div>
+  <select id="camPickB" title="Вторая камера"></select>
+  <button id="btnCamB">Включить 2-ю камеру</button>
+  <div class="frame">
+    <canvas id="frameBoxB" width="192" height="108"></canvas>
+    <div class="txt">
+      <div id="camBInfo">—</div>
+      <div id="camBHint" class="hint">2-я камера только смотрит: персонажем управляет первая</div>
+    </div>
+  </div>
+  <div class="row"><span class="k">Нога, см (1/2)</span><span id="camBDiff">—</span></div>
   <button id="btnTest">Тест без камеры</button>
   <button id="btnPlay">Проиграть клип FBX</button>
   <button id="btnCal">Перекалибровать</button>
@@ -163,6 +186,12 @@
 <div id="cam">
   <canvas id="overlay" width="320" height="240"></canvas>
   <video id="video" playsinline muted></video>
+</div>
+
+<div id="camB">
+  <video id="video2" playsinline muted></video>
+  <canvas id="overlayB" width="320" height="240"></canvas>
+  <div class="tag">камера 2 · наблюдатель</div>
 </div>
 
 <div id="count"></div>

@@ -17,6 +17,7 @@ import { buildBVH, buildLandmarkJson, downloadText } from './bvh.js';
 import { ArmsUpTrigger } from './gesture.js';
 import { TrimStrip } from './trim.js';
 import { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor } from './polish.js';
+import { LegGuard, LEG_POINTS } from './legs.js';
 
 const CONFIG = {
   // Скелет + клип Mixamo (можно положить любой FBX/GLB с ригом Mixamo)
@@ -263,6 +264,27 @@ function unpackWorld(buf) {
 // Ключевые точки, по которым решаем, что человек вообще виден
 const TRACK_JOINTS = [11, 12, 23, 24, 25, 26, 27, 28];
 
+// Последние точки ног с камеры 1 (в метрах, как их видит предохранитель) и
+// сглаженная длина ноги «бедро + голень». Длина ноги не зависит от ракурса,
+// поэтому по ней и сравниваем камеры: если у одной 84 см, а у другой 96 —
+// вторая врёт по глубине.
+let lastGuardPts = null;
+const cam1Leg = { l: 0, r: 0 };
+
+function legLengths(pts) {
+  const out = { l: 0, r: 0 };
+  for (const side of ['l', 'r']) {
+    const ids = LEG_POINTS[side];
+    const hip = pts[ids.hip];
+    const knee = pts[ids.knee];
+    const ankle = pts[ids.ankle];
+    if (!hip || !knee || !ankle) continue;
+    out[side] = Math.hypot(knee.x - hip.x, knee.y - hip.y, knee.z - hip.z)
+      + Math.hypot(ankle.x - knee.x, ankle.y - knee.y, ankle.z - knee.z);
+  }
+  return out;
+}
+
 function onPose(msg) {
   state.diagCount = msg.count;
   state.diagMs = msg.ms;
@@ -322,6 +344,14 @@ function processWorld(raw, opts = {}) {
       );
       return { x: v.x, y: v.y, z: v.z, visibility: p.visibility ?? 1 };
     });
+
+    // Снимок для сравнения с второй камерой: те же точки и сглаженная длина ноги.
+    lastGuardPts = guardPts;
+    const ll = legLengths(guardPts);
+    for (const side of ['l', 'r']) {
+      if (!ll[side]) continue;
+      cam1Leg[side] = cam1Leg[side] ? cam1Leg[side] * 0.9 + ll[side] * 0.1 : ll[side];
+    }
 
     // Ретаргет: FK по направлениям + IK по ногам + высота таза + корневое движение.
     retargeter.update(pts, {
@@ -435,37 +465,43 @@ function syntheticPose(t) {
 
 // ---------- оверлей с видео и точками ----------
 const overlay = $('overlay');
-const octx = overlay.getContext('2d');
 let videoEl = null;
 
 function drawOverlay(imageBuf) {
   if (!$('chkDebug').checked || !videoEl) return;
-  const w = overlay.width;
-  const h = overlay.height;
-  octx.save();
-  octx.clearRect(0, 0, w, h);
+  paintPreview(overlay, videoEl, imageBuf);
+}
 
-  const sc = Math.max(w / videoEl.videoWidth, h / videoEl.videoHeight);
-  const dw = videoEl.videoWidth * sc;
-  const dh = videoEl.videoHeight * sc;
-  octx.translate(w / 2, h / 2);
-  octx.scale(-1, 1); // зеркально, как в зеркале
-  octx.drawImage(videoEl, -dw / 2, -dh / 2, dw, dh);
-  octx.restore();
+// Общая отрисовка превью: видео зеркально + точки кадра. Годится обеим камерам.
+function paintPreview(cv, video, imageBuf) {
+  if (!cv || !video || !video.videoWidth) return;
+  const g = cv.getContext('2d');
+  const w = cv.width;
+  const h = cv.height;
+  g.save();
+  g.clearRect(0, 0, w, h);
+
+  const sc = Math.max(w / video.videoWidth, h / video.videoHeight);
+  const dw = video.videoWidth * sc;
+  const dh = video.videoHeight * sc;
+  g.translate(w / 2, h / 2);
+  g.scale(-1, 1); // зеркально, как в зеркале
+  g.drawImage(video, -dw / 2, -dh / 2, dw, dh);
+  g.restore();
 
   if (imageBuf) {
-    const arr = new Float32Array(imageBuf);
-    octx.save();
-    octx.fillStyle = '#63e6ff';
+    const arr = imageBuf instanceof Float32Array ? imageBuf : new Float32Array(imageBuf);
+    g.save();
+    g.fillStyle = '#63e6ff';
     for (let i = 0; i < arr.length; i += 4) {
       if (arr[i + 3] < 0.4) continue;
       const x = (1 - arr[i]) * w; // зеркально
       const y = arr[i + 1] * h;
-      octx.beginPath();
-      octx.arc(x, y, 3, 0, Math.PI * 2);
-      octx.fill();
+      g.beginPath();
+      g.arc(x, y, 3, 0, Math.PI * 2);
+      g.fill();
     }
-    octx.restore();
+    g.restore();
   }
 }
 
@@ -601,6 +637,7 @@ function loop() {
   lastTime = now;
 
   pumpVideo();
+  pumpObserver();
   const playRec = recorder && recorder.playing;
   if (state.synthetic && !playRec) processWorld(syntheticPose(now));
   if (recorder) {
@@ -754,6 +791,74 @@ function updateHud() {
     drawFrameBox(f, v.level);
   }
 
+  // 2-я камера: те же цифры, что у первой — доверие ногам, размер ноги в кадре,
+  // кадрирование и длина ноги. По ним и решается, помогает вторая камера или нет.
+  const bState = $('camBState');
+  if (bState) {
+    let text = 'выкл';
+    let cls = '';
+    if (obs.err) {
+      text = 'ошибка';
+      cls = 'bad';
+    } else if (obs.on) {
+      const age = obs.at ? performance.now() - obs.at : Infinity;
+      if (!obs.ready) {
+        text = 'модель…';
+      } else if (age > 1500) {
+        text = `${obs.fps} к/с · нет позы`;
+        cls = 'bad';
+      } else {
+        text = `${obs.fps} к/с · ${obs.w}×${obs.h}`;
+      }
+    }
+    if (bState.textContent !== text) bState.textContent = text;
+    bState.className = cls;
+  }
+
+  const bInfo = $('camBInfo');
+  if (bInfo) {
+    let text = '—';
+    let cls = '';
+    if (!obs.on) {
+      text = '—';
+    } else if (!obs.ready) {
+      text = 'загружаю модель…';
+    } else if (!obs.at) {
+      text = 'нет позы';
+      cls = 'bad';
+    } else {
+      text = obs.guard.describe();
+      cls = obs.guard.trusted.l && obs.guard.trusted.r ? 'ok' : 'bad';
+    }
+    if (bInfo.textContent !== text) bInfo.textContent = text;
+    bInfo.className = cls;
+  }
+
+  const bHint = $('camBHint');
+  if (bHint) {
+    const fB = obs.on && obs.ready ? framingReport(obs.image, obs.history) : null;
+    const vB = framingVerdict(fB);
+    let line = vB.hint;
+    if (obs.err) line = shortError(obs.err);
+    else if (!obs.on) line = '2-я камера только смотрит: персонажем управляет первая';
+    else if (!obs.ready) line = 'Гружу вторую модель MediaPipe…';
+    if (bHint.textContent !== line) bHint.textContent = line;
+    bHint.className = 'hint' + (obs.on && vB.level && vB.level !== 'ok' ? ' hot' : '');
+    drawFrameBox(fB, vB.level, 'frameBoxB');
+  }
+
+  const bDiff = $('camBDiff');
+  if (bDiff) {
+    const both = obs.on && obs.at && lastGuardPts && cam1Leg.l > 0 && obs.legLen.l > 0;
+    if (!both) {
+      if (bDiff.textContent !== '—') bDiff.textContent = '—';
+    } else {
+      const cm = (m) => Math.round(m * 100); // точки в метрах
+      const text = `L ${cm(cam1Leg.l)}/${cm(obs.legLen.l)} · R ${cm(cam1Leg.r)}/${cm(obs.legLen.r)}`;
+      if (bDiff.textContent !== text) bDiff.textContent = text;
+    }
+  }
+
   // Телеметрия: счётчик отправленных срезов
   const teleEl = $('teleState');
   if (teleEl) {
@@ -811,8 +916,7 @@ const SAFE_EDGE = 0.05; // минимальный запас до края, до
 const FRAME_MEMORY = 5000; // мс: помним худший запас за это время
 let frameHistory = [];
 
-function framingReport() {
-  const pts = lastImagePts;
+function framingReport(pts = lastImagePts, history = frameHistory) {
   if (!pts || pts.length < 33) return null;
   let minX = 1, maxX = 0, minY = 1, maxY = 0, n = 0, out = 0;
   for (const p of pts) {
@@ -851,14 +955,14 @@ function framingReport() {
   // Худшее за последние 5 с: в шаге тело поднимается выше и опускается ниже, чем
   // в стойке, и «запас сейчас» обманывает — смотреть надо на худший момент.
   const now = performance.now();
-  const last = frameHistory[frameHistory.length - 1];
+  const last = history[history.length - 1];
   if (!last || now - last.t > 150) {
-    frameHistory.push({ t: now, top: f.top, bottom: f.bottom, body: f.body });
-    while (frameHistory.length && now - frameHistory[0].t > FRAME_MEMORY) frameHistory.shift();
+    history.push({ t: now, top: f.top, bottom: f.bottom, body: f.body });
+    while (history.length && now - history[0].t > FRAME_MEMORY) history.shift();
   }
-  f.worstTop = Math.min(...frameHistory.map((h) => h.top));
-  f.worstBottom = Math.min(...frameHistory.map((h) => h.bottom));
-  f.worstBody = Math.max(...frameHistory.map((h) => h.body));
+  f.worstTop = Math.min(...history.map((h) => h.top));
+  f.worstBottom = Math.min(...history.map((h) => h.bottom));
+  f.worstBody = Math.max(...history.map((h) => h.body));
   return f;
 }
 
@@ -882,6 +986,7 @@ function framingVerdict(f) {
   // сколько кадра заняло бы всё тело, включая срезанное
   const extent = body + cutTop + cutBottom;
   const away = Math.max(0, Math.round((extent / fit - 1) * 100));
+  const needPct = Math.min(60, Math.max(5, away)); // «отойдите на 300 %» — это уже не совет
   const stepWord = away <= 5 ? 'чуть дальше' : away <= 16 ? 'на полшага дальше' : 'на шаг дальше';
   const tight = Math.min(f.top, f.bottom);
   const worst = Math.min(f.worstTop ?? f.top, f.worstBottom ?? f.bottom);
@@ -892,8 +997,8 @@ function framingVerdict(f) {
       level: cutNow ? 'bad' : 'tight',
       info: cutNow ? `${pct(body)} кадра · за краем` : `${pct(f.body)} кадра · в шаге за краем`,
       hint: cutNow
-        ? `Тело не влезает в кадр: отойдите ${stepWord} (примерно на ${Math.max(5, away)} % дальше) — срезанное модель дорисовывает.`
-        : `В стойке тело влезает, но в движении выходит за край: отойдите ${stepWord} (примерно на ${Math.max(5, away)} % дальше).`,
+        ? `Тело не влезает в кадр: отойдите ${stepWord} (примерно на ${needPct} % дальше) — срезанное модель дорисовывает.`
+        : `В стойке тело влезает, но в движении выходит за край: отойдите ${stepWord} (примерно на ${needPct} % дальше).`,
     };
   }
   if (body > fit) {
@@ -934,8 +1039,8 @@ function framingVerdict(f) {
 }
 
 // Схема кадра: где человек и где безопасная зона
-function drawFrameBox(f, level) {
-  const cv = $('frameBox');
+function drawFrameBox(f, level, canvasId = 'frameBox') {
+  const cv = $(canvasId);
   if (!cv) return;
   const g = cv.getContext('2d');
   const w = cv.width;
@@ -1010,6 +1115,35 @@ function telemetryPayload(now) {
       const f = framingReport();
       const v = framingVerdict(f);
       return f ? { ...f, level: v.level } : null;
+    })(),
+    // Длина ноги «бедро + голень» (м) по камере 1 — с ней сравнивается вторая.
+    legLen: { l: r3(cam1Leg.l), r: r3(cam1Leg.r) },
+    // 2-я камера: наблюдатель. Свои цифры, чтобы потом решать по ним, а не по
+    // ощущению «вроде лучше».
+    cam2: (() => {
+      if (!obs.on) return null;
+      const fB = framingReport(obs.image || [], obs.history);
+      const vB = framingVerdict(fB);
+      return {
+        on: true,
+        ready: obs.ready,
+        fps: obs.fps,
+        ms: r3(obs.ms),
+        vis: obs.vis,
+        video: [obs.w, obs.h],
+        ageMs: obs.at ? Math.round(performance.now() - obs.at) : null,
+        err: obs.err || null,
+        trust: obs.guard.snapshot(),
+        legLen: { l: r3(obs.legLen.l), r: r3(obs.legLen.r) },
+        frame: fB ? { ...fB, level: vB.level } : null,
+        img: obs.image
+          ? {
+            body: boxOf(obs.image, [0, 11, 12, 15, 16, 23, 24, 27, 28, 31, 32]),
+            legL: boxOf(obs.image, [23, 25, 27, 29, 31]),
+            legR: boxOf(obs.image, [24, 26, 28, 30, 32]),
+          }
+          : null,
+      };
     })(),
   };
 }
@@ -1143,9 +1277,8 @@ function telemetryToggle(on) {
 // ---------- камеры ----------
 let camStream = null;
 
-async function refreshCameras() {
-  const sel = $('camPick');
-  const list = await listCameras();
+function fillCamSel(sel, list, prefer) {
+  if (!sel) return;
   const cur = sel.value;
   sel.textContent = '';
   if (!list.length) {
@@ -1164,6 +1297,22 @@ async function refreshCameras() {
     sel.appendChild(o);
   }
   if (cur && list.some((c) => c.id === cur)) sel.value = cur;
+  else if (prefer && list.some((c) => c.id === prefer)) sel.value = prefer;
+}
+
+async function refreshCameras() {
+  const sel = $('camPick');
+  const list = await listCameras();
+  fillCamSel(sel, list, list[0]?.id);
+  // По умолчанию вторая камера — не та, что выбрана первой: одну и ту же
+  // камеру дважды не открыть, и это самая частая ошибка при двух камерах.
+  if (list.length) {
+    const first = sel.value || list[0].id;
+    const other = list.find((c) => c.id !== first) || list[0];
+    fillCamSel($('camPickB'), list, other.id);
+  } else {
+    fillCamSel($('camPickB'), list, null);
+  }
 }
 
 async function turnOnCamera() {
@@ -1182,6 +1331,186 @@ async function turnOnCamera() {
     console.warn('[mocap] getUserMedia', err);
   }
   $('btnCam').disabled = false;
+  updateHud();
+}
+
+// ---------- вторая камера: наблюдатель ----------
+// Пока НЕ управляет персонажем. Цель — увидеть по числам, что она реально даёт,
+// и только потом решать про слияние. Поэтому у неё своя модель MediaPipe (свой
+// воркер), свой предохранитель ног и своё кадрирование: иначе «лучше/хуже»
+// решается на глаз, а не по цифрам.
+const obs = {
+  on: false,
+  video: null,
+  stream: null,
+  label: '',
+  w: 0,
+  h: 0,
+  worker: null,
+  ready: false,
+  pending: false,
+  deviceId: '',
+  lastVideoTime: -1,
+  guard: new LegGuard(),
+  world: null,
+  image: null,
+  at: 0,
+  ms: 0,
+  seen: 0,
+  fps: 0,
+  fpsTime: 0,
+  vis: 0,
+  err: '',
+  history: [], // своя память кадрирования
+  legLen: { l: 0, r: 0 },
+};
+
+// В HUD — только первая фраза ошибки: остальное уходит в лог/статус.
+function shortError(text) {
+  const first = String(text).split('. ')[0];
+  return first.length > 110 ? first.slice(0, 108) + '…' : first;
+}
+
+function obsStartWorker() {
+  if (obs.worker) return;
+  obs.worker = new Worker('./src/pose.worker.js', { type: 'module' });
+  obs.worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'ready') {
+      obs.ready = true;
+      log('2-я камера: модель позы готова');
+    } else if (msg.type === 'pose') {
+      obs.pending = false;
+      onObsPose(msg);
+    } else if (msg.type === 'log') {
+      console.log('[worker2]', msg.text);
+    } else if (msg.type === 'error') {
+      obs.pending = false;
+      obs.err = msg.text;
+      log('2-я камера, поза: ' + msg.text);
+    }
+  };
+  obs.worker.postMessage({ type: 'init', wasmPath: CONFIG.wasmPath, modelPath: CONFIG.modelPath });
+}
+
+// Одна поза со второй камеры: доверие ногам, длины ног, точки на превью.
+function onObsPose(msg) {
+  const t = performance.now() / 1000;
+  const raw = unpackWorld(msg.world);
+  if (raw.length < 33) return; // пустой кадр — ждём следующий
+  const image = msg.image && msg.image.byteLength ? unpackWorld(msg.image) : null;
+  obs.world = raw;
+  obs.image = image;
+  obs.at = performance.now();
+  if (msg.ms) obs.ms = msg.ms;
+
+  let vis = 0;
+  for (const i of TRACK_JOINTS) vis += raw[i].visibility ?? 1;
+  obs.vis = +(vis / TRACK_JOINTS.length).toFixed(3);
+
+  // В те же координаты, что и камера 1: доверие и длины ног считаются одинаково.
+  const pts = raw.map((p) => {
+    const v = landmarkToWorld({ x: p.x, y: p.y, z: p.z * state.zGain }, state.mirror, new THREE.Vector3());
+    return { x: v.x, y: v.y, z: v.z, visibility: p.visibility ?? 1 };
+  });
+  obs.guard.update(pts, image, t);
+
+  const ll = legLengths(pts);
+  for (const side of ['l', 'r']) {
+    if (!ll[side]) continue;
+    obs.legLen[side] = obs.legLen[side] ? obs.legLen[side] * 0.9 + ll[side] * 0.1 : ll[side];
+  }
+
+  paintPreview($('overlayB'), obs.video, msg.image);
+
+  obs.seen++;
+  if (!obs.fpsTime) obs.fpsTime = t;
+  else if (t - obs.fpsTime > 0.5) {
+    obs.fps = Math.round(obs.seen / (t - obs.fpsTime));
+    obs.seen = 0;
+    obs.fpsTime = t;
+  }
+}
+
+function pumpObserver() {
+  if (!obs.on || !obs.ready || obs.pending || !obs.video || !obs.worker) return;
+  const v = obs.video;
+  if (v.readyState < 2) return;
+  if (v.currentTime === obs.lastVideoTime) return;
+  obs.lastVideoTime = v.currentTime;
+  obs.pending = true;
+  // Превью рисуем сразу по видео, не дожидаясь позы: если модель никого не
+  // найдёт, в окошке всё равно должно быть видно, что снимает камера.
+  paintPreview($('overlayB'), v, null);
+  createImageBitmap(v).then((bitmap) => {
+    obs.worker?.postMessage({ type: 'frame', bitmap, ts: performance.now() }, [bitmap]);
+  }).catch(() => { obs.pending = false; });
+}
+
+async function turnOnCameraB() {
+  const btn = $('btnCamB');
+  if (obs.on) { stopObserver(); return; }
+
+  const id = $('camPickB')?.value || undefined;
+  const idA = $('camPick')?.value || undefined;
+  if (id && idA && id === idA) {
+    obs.err = 'это та же камера, что и первая';
+    log('2-я камера: выбрана та же камера — выберите другую (телефон или вторую вебку)');
+    updateHud();
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  try {
+    const cam = await startCamera({ deviceId: id, width: 640, height: 480, videoEl: $('video2') });
+    obs.video = cam.video;
+    obs.stream = cam.stream;
+    obs.label = cam.label;
+    obs.w = cam.width;
+    obs.h = cam.height;
+    obs.on = true;
+    obs.err = '';
+    obs.deviceId = id || '';
+    obs.lastVideoTime = -1;
+    obs.guard.reset();
+    obs.history = [];
+    obs.legLen = { l: 0, r: 0 };
+    obs.seen = 0;
+    obs.fpsTime = 0;
+    obs.fps = 0;
+    obs.at = 0;
+    $('camB')?.classList.add('on');
+    obsStartWorker(); // вторая модель MediaPipe — только когда камера уже открылась
+    log(`2-я камера: ${cam.label} ${cam.width}x${cam.height}`);
+    await refreshCameras();
+  } catch (err) {
+    obs.err = describeCameraError(err);
+    log('2-я камера: ' + obs.err);
+    console.warn('[mocap] getUserMedia 2', err);
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = obs.on ? 'Выключить 2-ю камеру' : 'Включить 2-ю камеру';
+  }
+  updateHud();
+}
+
+function stopObserver() {
+  obs.on = false;
+  obs.err = '';
+  if (obs.stream) stopCamera(obs.stream);
+  obs.stream = null;
+  obs.video = null;
+  obs.world = null;
+  obs.image = null;
+  obs.at = 0;
+  obs.legLen = { l: 0, r: 0 };
+  obs.history = [];
+  obs.guard.reset();
+  $('camB')?.classList.remove('on');
+  const btn = $('btnCamB');
+  if (btn) btn.textContent = 'Включить 2-ю камеру';
+  log('2-я камера: выключена');
   updateHud();
 }
 
@@ -1570,9 +1899,22 @@ function wireUi() {
 
   $('camPick').addEventListener('change', async () => {
     if (state.camState !== 'ok') return;
+    // Вторая камера могла занять именно это устройство — освобождаем его.
+    if (obs.on && obs.deviceId && obs.deviceId === $('camPick').value) {
+      log('2-я камера: устройство занято первой камерой — выключаю наблюдателя');
+      stopObserver();
+    }
     stopCamera(camStream);
     camStream = null;
     await turnOnCamera();
+  });
+
+  $('btnCamB').addEventListener('click', turnOnCameraB);
+
+  // Телефон как веб-камера появляется в системе не сразу: без этого список
+  // камер пришлось бы обновлять перезагрузкой страницы.
+  navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+    refreshCameras().catch(() => {});
   });
 
   $('btnPlay').addEventListener('click', () => {
@@ -1730,6 +2072,14 @@ function wireUi() {
     qualityReport,
     framingReport,
     framingVerdict,
+    // 2-я камера-наблюдатель: цифры и отладочные входы
+    obs,
+    turnOnCameraB,
+    stopObserver,
+    obsStartWorker,
+    obsFeed: (world, image) => onObsPose({ world: packFlat(world), image: packFlat(image || []) }),
+    get cam1Leg() { return cam1Leg; },
+    legLengths,
     polishLib: { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor },
     footRestY,
     bvhText: () => (recorder?.hasClip ? buildBVH(bvhOptions()) : ''),
