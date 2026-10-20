@@ -224,8 +224,10 @@ async function loadRig() {
   });
   retargeter.setRoot(root);
 
+  const boneList = collectBones();
+  state.boneCount = boneList.length;
   recorder = new Recorder({
-    bones: collectBones(),
+    bones: boneList,
     root,
     fps: 30,
     warmup: 0.6,
@@ -248,15 +250,19 @@ async function loadRig() {
   // Клипы: у персонажа из пака своих анимаций нет — они лежат отдельными
   // файлами, но с тем же скелетом Mixamo.
   const own = root.animations || [];
-  if (own.length && !CONFIG.clips.length) {
-    CONFIG.clips.push({ name: own[0].name || 'клип из файла', clip: own[0] });
-  }
   mixer = new THREE.AnimationMixer(root);
   buildClipPick();
   const first = await setClip(0, { quiet: true });
   if (!first) {
-    $('clipName').textContent = 'нет';
-    if ($('btnPlay')) $('btnPlay').disabled = true;
+    // Пака нет, зато у самой модели есть клип — показываем его.
+    if (own.length) {
+      CONFIG.clips = [{ name: own[0].name || 'клип из файла', clip: own[0] }];
+      buildClipPick();
+      await setClip(0, { quiet: true });
+    } else {
+      $('clipName').textContent = 'нет';
+      if ($('btnPlay')) $('btnPlay').disabled = true;
+    }
   }
 
   return root;
@@ -548,6 +554,7 @@ function handleGesture() {
   }
   if (recorder.playing) recorder.togglePlay();
   lmFilter.reset();
+  beep(980, 90);
   recorder.beginCountdown(2.2);
   log('Жест принят: опустите руки и встаньте в позу — запись через 2 с');
   updateRecUi();
@@ -929,6 +936,10 @@ function updateRecState() {
 
   const camBox = $('cam');
   if (camBox) camBox.classList.toggle('rec', !!(recorder && recorder.recording));
+
+  // Клип нельзя менять на ходу записи: поза скакнёт в кадр записи.
+  const clipSel = $('clipPick');
+  if (clipSel) clipSel.disabled = CONFIG.clips.length < 2 || !!(recorder && recorder.recording);
 }
 
 function updateHud() {
@@ -948,7 +959,7 @@ function updateHud() {
     trackEl.textContent = 'тело не видно';
     trackEl.className = 'bad';
   }
-  $('bones').textContent = `${Object.keys(rig || {}).length}`;
+  $('bones').textContent = state.boneCount ? `${state.boneCount} (${Object.keys(rig || {}).length} управляемых)` : '—';
 
   // Скорость позы: главный ограничитель всего остального. Видно сразу,
   // на GPU модель или на CPU и сколько миллисекунд уходит на кадр.
@@ -1675,15 +1686,18 @@ function onObsPose(msg) {
 }
 
 function pumpObserver() {
-  if (!obs.on || !obs.ready || obs.pending || !obs.video || !obs.worker) return;
+  if (!obs.on || !obs.ready || !obs.video) return;
   const v = obs.video;
   if (v.readyState < 2) return;
   if (v.currentTime === obs.lastVideoTime) return;
   obs.lastVideoTime = v.currentTime;
-  obs.pending = true;
   // Превью рисуем сразу по видео, не дожидаясь позы: если модель никого не
   // найдёт, в окошке всё равно должно быть видно, что снимает камера.
   paintPreview($('overlayB'), v, null);
+  // В режиме клипа персонажем управляет анимация — вторая камера не нужна,
+  // и её воркер не должен занимать GPU.
+  if (state.mode === 'clip' || obs.pending || !obs.worker) return;
+  obs.pending = true;
   const job = frameForPose(v);
   if (!job) { obs.pending = false; return; }
   job.then((bitmap) => {
@@ -2309,6 +2323,20 @@ function wireUi() {
 }
 
 // ---------- старт ----------
+// ?model=heavy, которого нет в vendor/models, не должен ломать запуск:
+// проверяем файл и тихо откатываемся на full.
+async function resolveModelPath() {
+  try {
+    const r = await fetch(CONFIG.modelPath, { method: 'HEAD' });
+    if (r.ok) return CONFIG.modelPath;
+  } catch { /* нет файла или сети — не важно, ниже откат */ }
+  if (MODEL !== 'full') {
+    log(`Модели ${MODEL} нет в vendor/models — беру full`);
+    return '/vendor/models/pose_landmarker_full.task';
+  }
+  return CONFIG.modelPath;
+}
+
 (async function main() {
   resize();
   window.addEventListener('resize', resize);
@@ -2390,6 +2418,9 @@ function wireUi() {
     },
   };
 
+  CONFIG.modelPath = await resolveModelPath();
+  state.poseModel = /_lite\./.test(CONFIG.modelPath) ? 'lite'
+    : /_heavy\./.test(CONFIG.modelPath) ? 'heavy' : 'full';
   startPoseWorker();
   await loadRig();
   state.perm = await permissionState();

@@ -513,7 +513,8 @@ export class Retargeter {
       const prev = this._footPrev[side];
       if (prev && prev.planted && planted) {
         const dt = Math.max(1e-3, t - prev.t);
-        const v = Math.hypot(target.x - prev.x, target.z - prev.z) / dt;
+        // потолок: после «удержания» ноги точка может прыгнуть — это не скольжение
+        const v = Math.min(300, Math.hypot(target.x - prev.x, target.z - prev.z) / dt);
         this.slipRate[side] = this.slipRate[side] * 0.9 + v * 0.1;
       } else {
         this.slipRate[side] *= 0.9;
