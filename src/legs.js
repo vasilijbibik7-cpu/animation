@@ -35,8 +35,12 @@ export class LegGuard {
     this.goodSpan = opts.goodSpan ?? 0.17;
     // Прыжок меряем в метрах за кадр, но предел берём из скорости: иначе
     // на медленной машине (15 к/с) быстрый шаг выглядел бы как перескок.
-    this.maxSpeed = opts.maxSpeed ?? 3.5; // м/с — быстрее лодыжка не летает
-    this.minJump = opts.minJump ?? 0.12; // и не строже этого (30 к/с)
+    // Лодыжка в быстром марше/беге уходит на 10–20 см за кадр — это норма, а не
+    // перескок. Поэтому штраф мягкий: до jumpSoft× предела доверие только
+    // проседает, и в ноль его уводит лишь настоящий телепорт точки.
+    this.maxSpeed = opts.maxSpeed ?? 5.5; // м/с
+    this.minJump = opts.minJump ?? 0.22; // и не строже этого (30 к/с)
+    this.jumpSoft = opts.jumpSoft ?? 2.4; // во сколько раз перескок «смертелен»
     this.trustUp = opts.trustUp ?? 0.05; // доверие возвращается медленно
     this.trustDown = opts.trustDown ?? 0.55; // теряется быстро
     this.trustMin = opts.trustMin ?? 0.55; // порог «верим/держим»
@@ -53,6 +57,7 @@ export class LegGuard {
     this.span = { l: 0, r: 0 };
     this.vis = { l: 1, r: 1 };
     this.inFrame = { l: true, r: true };
+    this.jump = { l: 0, r: 0 };
     this.lostAt = { l: -1, r: -1 };
     this._prev = { l: null, r: null };
     this._lastT = 0;
@@ -122,8 +127,12 @@ export class LegGuard {
         q *= 0.75; // мелковато, но не смертельно — учитываем без «ярлыка»
       }
       if (jump > jumpLimit) {
-        q *= 0.15;
-        why = why || 'скачок';
+        // мягкий штраф: пока прыжок остаётся в пределах человеческой скорости,
+        // доверие только проседает, и IK продолжает работать (иначе быстрый
+        // подъём колена на миг «залипал»). В ноль уводит лишь настоящий перескок.
+        const u = smoothstep(jump, jumpLimit, jumpLimit * this.jumpSoft);
+        q *= 1 - u * 0.85;
+        if (u > 0.5) why = why || 'скачок';
       }
       if (!anat) {
         q *= 0.2;
@@ -134,6 +143,7 @@ export class LegGuard {
       this.vis[side] = vis;
       this.span[side] = span;
       this.inFrame[side] = inFrame;
+      this.jump[side] = jump;
       this.reason[side] = q >= this.trustMin ? '' : why || 'видимость';
 
       // асимметричное сглаживание: теряем доверие сразу, возвращаем неохотно
@@ -177,6 +187,7 @@ export class LegGuard {
       reason: { ...this.reason },
       span: { l: +this.span.l.toFixed(3), r: +this.span.r.toFixed(3) },
       vis: { l: +this.vis.l.toFixed(3), r: +this.vis.r.toFixed(3) },
+      jump: { l: +this.jump.l.toFixed(3), r: +this.jump.r.toFixed(3) },
       inFrame: { ...this.inFrame },
     };
   }

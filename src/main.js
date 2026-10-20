@@ -16,7 +16,7 @@ import { Recorder } from './record.js';
 import { buildBVH, buildLandmarkJson, downloadText } from './bvh.js';
 import { ArmsUpTrigger } from './gesture.js';
 import { TrimStrip } from './trim.js';
-import { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts } from './polish.js';
+import { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor } from './polish.js';
 
 const CONFIG = {
   // Скелет + клип Mixamo (можно положить любой FBX/GLB с ригом Mixamo)
@@ -1053,6 +1053,7 @@ function jsonMeta() {
       driftCm: +(q.drift * k).toFixed(2),
       maxRootSpeedMs: +(q.maxSpeed / perMeter).toFixed(2),
       minFootY: +q.minFootY.toFixed(3),
+      footBelowFloorCm: +Math.max(0, -q.minFootAboveFloor * k).toFixed(2),
     },
     loop,
     polish: state.polish || null,
@@ -1175,10 +1176,22 @@ function plantEpsValue() {
   return leg * 0.03;
 }
 
+// Высота четырёх костей стопы над полом в rest-позе — в том же порядке, что и
+// frame.feet: [лодыжка L, носок L, лодыжка R, носок R]. По ней считается, какая
+// точка стопы провалилась ниже пола (пол — это y = 0 после fitScene).
+function footRestY() {
+  const r = restPose?.rest;
+  return ['lFoot', 'lToe', 'rFoot', 'rToe'].map((key) => +((r?.[key]?.worldPos?.y) ?? 0).toFixed(3));
+}
+
 let polishUndo = null; // { before, after } — для отмены шлифовки
 
 function qualityReport() {
-  return analyze(recorder.rawClip(), { plantEps: plantEpsValue(), fps: recorder.fps });
+  return analyze(recorder.rawClip(), {
+    plantEps: plantEpsValue(),
+    fps: recorder.fps,
+    restY: footRestY(),
+  });
 }
 
 function doPolish() {
@@ -1186,7 +1199,8 @@ function doPolish() {
   const wantSmooth = $('chkPolishSmooth').checked;
   const wantPin = $('chkPolishPin').checked;
   const wantDrift = $('chkPolishDrift').checked;
-  if (!wantSmooth && !wantPin && !wantDrift) {
+  const wantFloor = $('chkPolishFloor')?.checked ?? false;
+  if (!wantSmooth && !wantPin && !wantDrift && !wantFloor) {
     log('Шлифовка: выберите хотя бы один проход');
     return;
   }
@@ -1215,17 +1229,29 @@ function doPolish() {
     frames = r.frames;
     parts.push(`дрейф ${(r.driftBefore * k).toFixed(1)} → ${(r.driftAfter * k).toFixed(1)} см`);
   }
+  // Пол — последним: он единственный двигает вверх и должен остаться гарантией.
+  if (wantFloor) {
+    const r = clearFloor(frames, { restY: footRestY(), maxLift: (retargeter?.legSpan || 95) * 0.3 });
+    frames = r.frames;
+    if (r.lifted) {
+      parts.push(`пол ${(r.penetrationBefore * k).toFixed(1)} → ${(r.penetrationAfter * k).toFixed(1)} см (подъём до ${(r.maxLift * k).toFixed(1)} см)`);
+      if (r.clamped) parts.push(`в ${r.clamped} кадрах упёрлось в предел — осталось ${(r.penetrationAfter * k).toFixed(1)} см`);
+    } else {
+      parts.push('пол: стопы не проваливались');
+    }
+  }
 
   polishUndo = { before, after: frames };
   recorder.replaceFrames(frames, { keepTrim: true });
   // Итог считаем по конечным кадрам: приклейка стоп и «шаг на месте» тянут
   // в разные стороны (по определению: стоящий на месте персонаж не может
   // нести опорную стопу вместе с собой), и это должно быть видно числом.
-  const fin = analyze(frames, { plantEps: eps, fps: recorder.fps });
+  const fin = analyze(frames, { plantEps: eps, fps: recorder.fps, restY: footRestY() });
   state.polish = {
-    passes: [wantSmooth && 'smooth', wantPin && 'pinFeet', wantDrift && 'removeDrift'].filter(Boolean),
+    passes: [wantSmooth && 'smooth', wantPin && 'pinFeet', wantDrift && 'removeDrift', wantFloor && 'clearFloor'].filter(Boolean),
     slideCm: +(fin.slideSingle * k).toFixed(2),
     driftCm: +(fin.drift * k).toFixed(2),
+    footBelowFloorCm: +Math.max(0, -fin.minFootAboveFloor * k).toFixed(2),
   };
   log(`Шлифовка: ${parts.join(' · ')} → итог: скольжение ${(fin.slideSingle * k).toFixed(1)} см, дрейф ${(fin.drift * k).toFixed(1)} см`);
 }
@@ -1292,9 +1318,11 @@ function updatePolishUi() {
     } else {
       const q = qualityReport();
       const k = cmScale();
+      const below = Math.max(0, -q.minFootAboveFloor * k);
       qEl.textContent =
         `${q.frames} кадр. · ${q.contacts} контактов (${q.contactSeconds} с) · ` +
-        `скольжение ${(q.slideSingle * k).toFixed(1)} см · дрейф ${(q.drift * k).toFixed(1)} см`;
+        `скольжение ${(q.slideSingle * k).toFixed(1)} см · дрейф ${(q.drift * k).toFixed(1)} см` +
+        (below > 0.5 ? ` · под полом ${below.toFixed(1)} см` : '');
     }
   }
 }
@@ -1514,7 +1542,8 @@ function wireUi() {
     undoPolish,
     doAlignLoop,
     qualityReport,
-    polishLib: { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts },
+    polishLib: { analyze, alignLoop, pinFeet, removeDrift, smoothFrames, footContacts, clearFloor },
+    footRestY,
     bvhText: () => (recorder?.hasClip ? buildBVH(bvhOptions()) : ''),
     jsonText: () => (recorder?.hasClip ? buildLandmarkJson(recorder, jsonMeta()) : ''),
     // Прогнать статичную картинку через тот же путь, что и камеру

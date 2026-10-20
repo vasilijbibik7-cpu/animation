@@ -9,7 +9,8 @@
 //     (нужно для клипов «шаг на месте»);
 //   • дрожь: скользящее среднее по кватернионам;
 //   • стык петли: ищем в записи период движения и окно с минимальным
-//     расхождением поз — тогда петля крутится без рывка.
+//     расхождением поз — тогда петля крутится без рывка;
+//   • пол: стопа не должна проваливаться ниже плоскости пола.
 //
 // Ни одна функция не меняет вход: кадры возвращаются новыми объектами.
 import * as THREE from 'three';
@@ -264,6 +265,87 @@ export function removeDrift(frames) {
   return { frames: out, driftBefore: Math.hypot(dx, dz), driftAfter: 0 };
 }
 
+// ---------- пол ----------
+// Ни одна точка стопы не должна оказаться ниже пола (y = 0). Проваливается она
+// по двум причинам: высота таза догоняет стопу с задержкой (followFeet — это
+// фильтр), и нога, которой предохранитель не верит, держится в системе таза —
+// если таз в этот момент опустился, удержанная стопа уезжает под пол. В Blender
+// и в движке это видно как ступня, провалившаяся сквозь плоскость пола.
+//
+// Правка — сдвиг ВСЕГО персонажа вверх на глубину погружения самой низкой точки
+// стопы, кадр за кадром. Поза относительно таза не меняется (подъём одинаков для
+// таза и стоп), а самая низкая стопа встаёт ровно на пол. Кривая сдвига
+// сглаживается, иначе в клипе появится ступенька; но уменьшать её ниже нужной
+// нельзя — под пол не пускаем. Вниз не двигаем никогда: прыжок остаётся прыжком.
+//
+// restY — высота четырёх костей стоп (лодыжка/носок ×2, порядок как в
+// frame.feet) над полом в rest-позе: по ней считается «глубина» каждой точки.
+export function clearFloor(frames, { restY = null, maxLift = Infinity } = {}) {
+  const n = frames.length;
+  const rY = restY && restY.length === 4 ? restY : [0, 0, 0, 0];
+  const pen = new Float64Array(n); // > 0 — насколько точка стопы ниже пола
+  let penBefore = 0;
+  for (let i = 0; i < n; i++) {
+    const feet = frames[i].feet;
+    if (!feet || !feet.length) continue;
+    let deep = 0;
+    for (let k = 0; k < 4; k++) deep = Math.max(deep, rY[k] - feet[k * 3 + 1]);
+    pen[i] = deep;
+    if (deep > penBefore) penBefore = deep;
+  }
+  if (!(penBefore > 0)) {
+    return { frames, penetrationBefore: 0, penetrationAfter: 0, maxLift: 0, lifted: 0, clamped: 0 };
+  }
+
+  // окно: подъём начинается до входа в пол и заканчивается после выхода,
+  // иначе на границе получится излом «стоял — присел»
+  const wide = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let m = 0;
+    for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) m = Math.max(m, pen[j]);
+    wide[i] = m;
+  }
+
+  const corr = new Float64Array(n);
+  let liftMax = 0;
+  let lifted = 0;
+  let clamped = 0;
+  for (let i = 0; i < n; i++) {
+    let s = 0;
+    let c = 0;
+    for (let j = Math.max(0, i - 2); j <= Math.min(n - 1, i + 2); j++) {
+      s += wide[j];
+      c++;
+    }
+    // мягкий сдвиг, но не меньше требуемого: сумма под пол не пускает
+    const want = Math.max(s / c, pen[i]);
+    const lift = Math.min(want, maxLift);
+    if (want > maxLift) clamped++;
+    corr[i] = lift;
+    if (lift > liftMax) liftMax = lift;
+    if (lift > 0) lifted++;
+  }
+
+  let penAfter = 0;
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const lift = corr[i];
+    if (!(lift > 0)) {
+      out[i] = frames[i];
+      continue;
+    }
+    const f = cloneFrame(frames[i]);
+    f.root[1] += lift;
+    f.hipsWorld[1] += lift;
+    for (let k = 0; k < 4; k++) f.feet[k * 3 + 1] += lift;
+    const deep = pen[i] - lift;
+    if (deep > penAfter) penAfter = deep;
+    out[i] = f;
+  }
+
+  return { frames: out, penetrationBefore: penBefore, penetrationAfter: penAfter, maxLift: liftMax, lifted, clamped };
+}
+
 // ---------- сглаживание ----------
 // Скользящее среднее по кватернионам (со выравниванием знака, иначе slerp
 // уходит «через другую сторону») и по положению корня.
@@ -385,15 +467,20 @@ export function alignLoop(frames, { fps = 30, minPeriod = 0.4, maxPeriod = 2.4, 
 }
 
 // ---------- сводка по качества ----------
-export function analyze(frames, { plantEps = 3, fps = 30 } = {}) {
+export function analyze(frames, { plantEps = 3, fps = 30, restY = null } = {}) {
   const contacts = footContacts(frames, { plantEps, fps });
   const n = frames.length;
+  const rY = restY && restY.length === 4 ? restY : null;
   let minFoot = Infinity;
+  let minAbove = Infinity; // самая низкая точка стопы относительно пола
   let maxSpeed = 0;
   for (let i = 0; i < n; i++) {
     const feet = frames[i].feet;
     if (!feet || !feet.length) continue;
-    for (const k of [FOOT.L, FOOT.LTOE, FOOT.R, FOOT.RTOE]) minFoot = Math.min(minFoot, fy(feet, k));
+    for (const k of [FOOT.L, FOOT.LTOE, FOOT.R, FOOT.RTOE]) {
+      minFoot = Math.min(minFoot, fy(feet, k));
+      if (rY) minAbove = Math.min(minAbove, fy(feet, k) - rY[k]);
+    }
     if (i > 0) {
       const dx = frames[i].root[0] - frames[i - 1].root[0];
       const dz = frames[i].root[2] - frames[i - 1].root[2];
@@ -410,6 +497,8 @@ export function analyze(frames, { plantEps = 3, fps = 30 } = {}) {
     slideSingle: slideOf(frames, contacts.intervals, { planted: contacts.planted, singleOnly: true, only: contacts.stable }),
     drift,
     minFootY: Number.isFinite(minFoot) ? minFoot : 0,
+    // < 0 — стопа под полом (в единицах модели)
+    minFootAboveFloor: rY && Number.isFinite(minAbove) ? minAbove : 0,
     maxSpeed,
   };
 }
